@@ -1,5 +1,10 @@
 $ErrorActionPreference = 'Stop'
-$root = 'C:\Users\revehiet\flip_water_addon'
+# Repo root = parent of the scripts/ folder this script lives in, so it works
+# from any checkout location.
+$root = Split-Path -Parent $PSScriptRoot
+if (-not (Test-Path (Join-Path $root 'blender_manifest.toml'))) {
+    throw "Repo root not found above $PSScriptRoot (no blender_manifest.toml)"
+}
 $distDir = Join-Path $root 'dist'
 $pkgName = 'flip_water_addon'
 $stageRoot = Join-Path $distDir $pkgName
@@ -43,7 +48,8 @@ Get-ChildItem -Path $root -Force | ForEach-Object {
         Get-ChildItem -Path $destTop -Recurse -Force -Directory |
             Where-Object { $_.Name -in @('__pycache__', '.venv') } |
             Remove-Item -Recurse -Force
-        Get-ChildItem -Path $destTop -Recurse -Force -Include *.pyc,*.pyo |
+        Get-ChildItem -Path $destTop -Recurse -Force -File |
+            Where-Object { $_.Extension -in @('.pyc', '.pyo') } |
             Remove-Item -Force
     } else {
         if ($_.Extension -in @('.pyc', '.pyo', '.zip', '.whl')) { return }
