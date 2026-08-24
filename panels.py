@@ -1644,6 +1644,13 @@ class FLIPWATER_ND_mpm_solver(_FLIPWATER_NodeBase, bpy.types.Node):
         name="Wall Friction", default=0.0, min=0.0, max=1.0,
         description="Boundary friction coefficient at domain walls")
 
+    mpm_seed_preview: bpy.props.BoolProperty(
+        name="Seed Preview",
+        default=True,
+        description="Show the initial MPM particles in the viewport before "
+                    "baking — mesh emission from the Particles input, or a "
+                    "centered block on the domain floor as fallback")
+
     def init(self, _context):
         self.inputs.new("FLIPWATER_NodeSocket", "Domain")
         self.inputs.new("FLIPWATER_NodeSocket", "Particles")
@@ -1657,6 +1664,9 @@ class FLIPWATER_ND_mpm_solver(_FLIPWATER_NodeBase, bpy.types.Node):
             layout.label(text=f"Domain: {domain_obj.name}", icon='CUBE')
         elif err:
             layout.label(text=err, icon='ERROR')
+
+        layout.prop(self, "mpm_seed_preview", text="Seed Preview",
+                    toggle=True, icon='HIDE_OFF' if self.mpm_seed_preview else 'HIDE_ON')
 
         # Material preset
         box = layout.box()
@@ -1691,6 +1701,8 @@ class FLIPWATER_ND_mpm_solver(_FLIPWATER_NodeBase, bpy.types.Node):
         col3.prop(self, "mpm_substeps")
         col3.prop(self, "mpm_flip_ratio")
         col3.prop(self, "mpm_friction")
+        col3.separator()
+        col3.label(text="Colliders: not supported yet", icon='INFO')
 
         # Baking & preview live on the Cache node (connect MPM Solver -> Cache).
         mpm_props = getattr(_context.scene, "flip_water_mpm", None)

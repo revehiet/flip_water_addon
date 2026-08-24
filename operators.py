@@ -97,6 +97,97 @@ def _overlay_render_style(props):
     return getattr(props, "particle_overlay_render_style", 'SPHERES')
 
 
+# ── MPM seeding helpers ─────────────────────────────────────────────────────
+# The bake operator and the viewport preview share compute_mpm_initial_particles
+# so the two can never drift apart (drift between the boundary-box fit and the
+# seed generator historically produced seeds outside the box, which the
+# advection clamp flattened onto the walls — the "line of points" artifact).
+
+def _mpm_source_objects(node):
+    """Objects feeding the MPM node's 'Particles' input. Follows direct links
+    and Cache/Merge chains; returns Emitter objects (possibly empty)."""
+    from . import panels
+    queue = panels._linked_nodes_from_input(node, "Particles")
+    seen, objs = set(), []
+    while queue:
+        src = queue.pop(0)
+        if src.name in seen:
+            continue
+        seen.add(src.name)
+        bid = src.bl_idname
+        if bid == "FLIPWATER_ND_emitter":
+            obj = getattr(src, "emitter_object", None)
+            if obj is not None and obj.name in bpy.data.objects:
+                objs.append(obj)
+        elif bid == "FLIPWATER_ND_merge":
+            queue.extend(panels._linked_nodes_from_merge_inputs(src))
+        elif bid == "FLIPWATER_ND_cache":
+            queue.extend(panels._linked_nodes_from_input(src, "Data"))
+    return objs
+
+
+def _mpm_grid_for_node(node):
+    """Boundary box ((origin), (res)) for an MPM node — the single, shared
+    domain fit used by both the bake and the seed preview."""
+    from . import panels, mpm_utils
+    stride = float(node.mpm_grid_stride)
+    domain_obj, _err = panels._resolve_mpm_solver_domain(node)
+    if domain_obj is not None:
+        mn, mx = _world_bounds(domain_obj)
+        origin, res = mpm_utils.resolve_grid(
+            mn, np.asarray(mx) - np.asarray(mn), stride)
+        return (origin, res), domain_obj.name
+    r = max(1, int(node.mpm_grid_res))
+    return ((0.0, 0.0, 0.0), (r, r, r)), None
+
+
+def compute_mpm_initial_particles(context, node):
+    """Compute the exact initial particles an MPM bake would start from.
+
+    Returns (positions (N,3) float32, (origin, res), source_description).
+    Priority: mesh emission from Emitter objects wired into the 'Particles'
+    input; fallback: a centered block resting on the domain floor.
+    """
+    from . import mpm_utils, voxelize
+
+    stride = float(node.mpm_grid_stride)
+    (origin, res), _domain_name = _mpm_grid_for_node(node)
+
+    pts = np.zeros((0, 3), dtype=np.float32)
+    source = "domain block"
+    objs = _mpm_source_objects(node)
+    if objs:
+        depsgraph = context.evaluated_depsgraph_get()
+        chunks = []
+        for i, obj in enumerate(objs):
+            # Spacing h/2 → 2 particles per axis per cell, matching the
+            # solver's (h/2)^3 particle-volume calibration in MpmSolver.cu.
+            try:
+                chunk = voxelize.sample_points_mesh(
+                    depsgraph, obj, stride, 2, seed=12345 + i, lattice="AA")
+            except RuntimeError:
+                # Open/non-manifold meshes can defeat BVH inside-tests; fall
+                # back to the object's bounding box so users still get seeds.
+                mn, mx = _world_bounds(obj)
+                chunk = voxelize.sample_points_bounds(
+                    mn, mx, stride, 2, seed=12345 + i, lattice="AA")
+            if chunk.shape[0]:
+                chunks.append(chunk.astype(np.float32))
+        if chunks:
+            pts = mpm_utils.filter_to_box(
+                np.concatenate(chunks, axis=0), origin, res, stride)
+            source = "+".join(o.name for o in objs)
+
+    # Hard safety cap (~148 bytes/particle of GPU memory in the core).
+    if pts.shape[0] > 2_000_000:
+        pts = pts[_subsample_indices(pts.shape[0], 2_000_000)]
+
+    if pts.shape[0] < 4:
+        pts = mpm_utils.build_block_seeds(origin, res, stride)
+        source = "domain block"
+    return np.ascontiguousarray(pts, dtype=np.float32), (origin, res), source
+
+
 def _filter_points_inside_domain(points, domain_min, domain_max, margin):
     if points.shape[0] == 0:
         return points
@@ -1119,6 +1210,103 @@ def sync_seed_previews_from_node_graph(context):
             refresh_seed_preview_if_active(context, domain_name)
 
     check_emitter_transforms_for_seed_preview(context)
+
+
+# ── MPM seed preview (mirrors the FLIP seed-preview trio above) ─────────────
+# State keyed by (tree_name, node_name) — the same convention the wake solver
+# uses for its per-node state.
+
+_mpm_seed_previews = {}       # key -> signature describing current sources
+_mpm_seed_matrix_cache = {}   # object name -> last world-matrix tuple
+_mpm_seed_points_cache = {}   # key -> True once points were built
+
+
+def _mpm_preview_key(tree_name, node_name):
+    return f"mpm_seed:{tree_name}:{node_name}"
+
+
+def refresh_mpm_seed_preview(context, key):
+    """(Re)draws one MPM node's initial-particle cloud in the viewport."""
+    tree_name, node_name = key
+    ng = bpy.data.node_groups.get(tree_name)
+    node = ng.nodes.get(node_name) if ng is not None else None
+    pkey = _mpm_preview_key(*key)
+    if node is None:
+        preview_overlay.clear_particle_preview(pkey)
+        return
+    pts, _box, _src = compute_mpm_initial_particles(context, node)
+    if pts.shape[0] == 0:
+        preview_overlay.clear_particle_preview(pkey)
+        return
+    idx2 = _subsample_indices(pts.shape[0], 100000)
+    preview_overlay.set_particle_preview(
+        pkey,
+        np.ascontiguousarray(pts[idx2], dtype=np.float32),
+        color=(0.20, 0.85, 1.00, 0.90),   # cyan — distinct from bake orange
+        point_size=2.0,
+        style='POINTS',
+    )
+    _mpm_seed_points_cache[key] = True
+
+
+def sync_mpm_seed_previews_from_node_graph(context):
+    """Keeps MPM seed-cloud previews in sync with the node graph — mirrors
+    sync_seed_previews_from_node_graph for the FLIP solver."""
+    from . import panels
+
+    props = getattr(context.scene, "flip_water_mpm", None)
+    baking = bool(props is not None and props.is_baking)
+
+    desired = {}
+    for tree in bpy.data.node_groups:
+        if tree.bl_idname != panels.TREE_IDNAME:
+            continue
+        for node in tree.nodes:
+            if node.bl_idname != "FLIPWATER_ND_mpm_solver":
+                continue
+            if baking or not getattr(node, "mpm_seed_preview", False):
+                continue
+            (_origin, _res), domain_name = _mpm_grid_for_node(node)
+            desired[(tree.name, node.name)] = {
+                "domain": domain_name,
+                "sources": tuple(sorted(o.name for o in _mpm_source_objects(node))),
+                "stride": float(node.mpm_grid_stride),
+                "res_fallback": int(node.mpm_grid_res),
+            }
+
+    for key in list(_mpm_seed_previews.keys()):
+        if key not in desired:
+            preview_overlay.clear_particle_preview(_mpm_preview_key(*key))
+            _mpm_seed_previews.pop(key, None)
+            _mpm_seed_points_cache.pop(key, None)
+
+    for key, sig in desired.items():
+        changed = _mpm_seed_previews.get(key) != sig
+        _mpm_seed_previews[key] = sig
+        if changed or key not in _mpm_seed_points_cache:
+            refresh_mpm_seed_preview(context, key)
+
+    _check_mpm_source_transforms(context)
+
+
+def _check_mpm_source_transforms(context):
+    """Refresh any preview whose source objects moved/rotated/scaled."""
+    if not _mpm_seed_previews:
+        return
+    dirty = set()
+    for key in list(_mpm_seed_previews.keys()):
+        ng = bpy.data.node_groups.get(key[0])
+        node = ng.nodes.get(key[1]) if ng is not None else None
+        if node is None:
+            continue
+        for obj in _mpm_source_objects(node):
+            mk = _emitter_matrix_key(obj)
+            cached = _mpm_seed_matrix_cache.get(obj.name)
+            _mpm_seed_matrix_cache[obj.name] = mk
+            if cached is not None and cached != mk:
+                dirty.add(key)
+    for key in dirty:
+        refresh_mpm_seed_preview(context, key)
 
 
 def _particles_consumed_by_surface(domain_obj):
@@ -2581,27 +2769,15 @@ class FLIPWATER_OT_bake_mpm(bpy.types.Operator):
 
         settings = core.MpmSettings()
         # The MPM boundary box must match the upstream Domain node's world
-        # bounds, otherwise particles seeded from the domain get clamped onto
-        # the origin-aligned [0, res*stride] box (for domains not starting at
-        # the origin this collapses the seed block onto the box walls — the
-        # "line of points along +Y" artifact).
-        from . import panels
-        domain_obj, _derr = panels._resolve_mpm_solver_domain(node)
+        # bounds AND the seed generator must use the identical fit — a mismatch
+        # spawns seeds outside the box, which the advection clamp then flattens
+        # onto the walls (the historical "line of points along +Y" artifact).
+        # Both paths now share mpm_utils.resolve_grid via _mpm_grid_for_node.
+        (origin, res), _domain_name = _mpm_grid_for_node(node)
         stride = node.mpm_grid_stride
-        if domain_obj is not None:
-            mn, mx = _world_bounds(domain_obj)
-            settings.grid_origin_x = float(mn[0])
-            settings.grid_origin_y = float(mn[1])
-            settings.grid_origin_z = float(mn[2])
-            settings.grid_res_x = max(1, int((float(mx[0]) - float(mn[0])) / stride + 0.5))
-            settings.grid_res_y = max(1, int((float(mx[1]) - float(mn[1])) / stride + 0.5))
-            settings.grid_res_z = max(1, int((float(mx[2]) - float(mn[2])) / stride + 0.5))
-        else:
-            r = node.mpm_grid_res
-            settings.grid_res_x = r
-            settings.grid_res_y = r
-            settings.grid_res_z = r
-        settings.grid_stride = node.mpm_grid_stride
+        settings.grid_origin_x, settings.grid_origin_y, settings.grid_origin_z = origin
+        settings.grid_res_x, settings.grid_res_y, settings.grid_res_z = res
+        settings.grid_stride = stride
         settings.delta_time = 1.0 / (24.0 * float(node.mpm_substeps))
         settings.substeps_per_frame = node.mpm_substeps
         settings.flip_ratio = node.mpm_flip_ratio
@@ -2625,55 +2801,21 @@ class FLIPWATER_OT_bake_mpm(bpy.types.Operator):
         return settings, None
 
     def _seed_particles(self, context):
-        """Generate initial MPM particle positions from connected emitters."""
-        # For now: seed a block of particles at the grid center
-        # TODO: read from connected emitter object/domain bounds
+        """Generate initial MPM particle positions — thin wrapper over the
+        shared compute_mpm_initial_particles() so bake seeding and the seed
+        preview can never diverge."""
         ng = bpy.data.node_groups.get(self.node_tree_name)
-        if ng is None:
-            return np.zeros((0, 3), dtype=np.float32)
-
-        node = ng.nodes.get(self.node_name)
+        node = ng.nodes.get(self.node_name) if ng is not None else None
         if node is None:
             return np.zeros((0, 3), dtype=np.float32)
 
-        # Walk upstream to find a Domain node for bounds, or use defaults
-        h = node.mpm_grid_stride
-        ox, oy, oz = 0.0, 0.0, 0.0
-        r = node.mpm_grid_res
-        rx = ry = rz = r
-
-        # Try to get domain bounds from a connected Domain node
-        for sock in node.inputs:
-            for link in sock.links:
-                src = link.from_node
-                if src.bl_idname == "FLIPWATER_ND_domain":
-                    dom_obj = getattr(src, "domain_object", None)
-                    if dom_obj is not None:
-                        mn, mx = _world_bounds(dom_obj)
-                        ox, oy, oz = float(mn[0]), float(mn[1]), float(mn[2])
-                        rx = int((float(mx[0]) - ox) / h + 0.5)
-                        ry = int((float(mx[1]) - oy) / h + 0.5)
-                        rz = int((float(mx[2]) - oz) / h + 0.5)
-
-        # Seed a cube of 2 particles per cell in the lower half of the domain
-        ppc = 2
-        sx = max(1, rx // 2)
-        sy = max(1, ry)
-        sz = max(1, rz // 2)
-
-        positions = []
-        for ix in range(sx * ppc):
-            for iy in range(sy * ppc):
-                for iz in range(sz * ppc):
-                    px = ox + (float(ix) + 0.5) * h / float(ppc)
-                    py = oy + (float(iy) + 0.5) * h / float(ppc)
-                    pz = oz + (float(iz) + 0.5) * h / float(ppc)
-                    positions.append((px, py, pz))
-
-        arr = np.array(positions, dtype=np.float32)
-        print(f"[MPM] Seeded {arr.shape[0]} particles in block "
-              f"[{ox:.2f},{oy:.2f},{oz:.2f}] → [{ox+sx*h:.2f},{oy+sy*h:.2f},{oz+sz*h:.2f}]")
-        return arr
+        positions, (origin, res), source = compute_mpm_initial_particles(
+            context, node)
+        from . import mpm_utils
+        print(f"[MPM] Seeded {positions.shape[0]} particles ({source}); "
+              f"boundary box {origin} → "
+              f"{mpm_utils.box_max(origin, res)}")
+        return positions
 
     def _domain_object(self):
         """Resolve the upstream FLIP domain object of the MPM solver node."""
@@ -2732,6 +2874,14 @@ class FLIPWATER_OT_bake_mpm(bpy.types.Operator):
         solver = core.MpmSolver()
         solver.init(positions, settings)
         self._solver = solver
+
+        # Clear any pre-bake seed preview for this node — the live bake
+        # preview takes over from here.
+        try:
+            preview_overlay.clear_particle_preview(
+                f"mpm_seed:{self.node_tree_name}:{self.node_name}")
+        except Exception:  # noqa: BLE001
+            pass
 
         # Cache directory
         self._cache_dir = _mpm_cache_dir_for(self.node_name)
@@ -2912,3 +3062,6 @@ def unregister():
     _active_seed_previews.clear()
     _seed_preview_matrix_cache.clear()
     _seed_preview_points_cache.clear()
+    _mpm_seed_previews.clear()
+    _mpm_seed_matrix_cache.clear()
+    _mpm_seed_points_cache.clear()

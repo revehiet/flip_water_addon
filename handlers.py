@@ -83,6 +83,7 @@ def flip_water_depsgraph_update(scene, depsgraph=None):
     operators.refresh_all_domain_voxel_guides(bpy.context, scene)
     _check_obstacle_transforms(scene)
     operators.sync_seed_previews_from_node_graph(bpy.context)
+    operators.sync_mpm_seed_previews_from_node_graph(bpy.context)
     panels.refresh_all_tank_overlays()
     _seed_new_node_trees()
 
