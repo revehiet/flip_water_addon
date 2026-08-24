@@ -1,7 +1,9 @@
 import sys
 import numpy as np
 
-sys.path.insert(0, r"C:\Users\revehiet")
+from pathlib import Path
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT))
 from flip_water_addon import solver_bridge
 
 core, err = solver_bridge.load()

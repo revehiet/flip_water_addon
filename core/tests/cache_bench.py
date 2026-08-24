@@ -2,7 +2,7 @@ r"""Quick size/speed benchmark for the particle + surface cache formats.
 
 Run headless:
   blender --background --factory-startup --python-expr
-  "import sys; sys.path.insert(0, r'C:\Users\revehiet'); exec(open(r'C:\Users\revehiet\flip_water_addon\core\tests\cache_bench.py', encoding='utf-8').read())"
+  "import sys; sys.path.insert(0, r'<parent-of-repo>'); exec(open(r'<repo>\core\tests\cache_bench.py', encoding='utf-8').read())"
 """
 import os
 import sys
@@ -10,7 +10,9 @@ import time
 
 import numpy as np
 
-sys.path.insert(0, r"C:\Users\revehiet")
+from pathlib import Path
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT))
 import flip_water_addon  # noqa: E402
 flip_water_addon.register()
 

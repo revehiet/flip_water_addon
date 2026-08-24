@@ -14,12 +14,14 @@ from types import SimpleNamespace
 
 import numpy as np
 
-sys.path.insert(0, r"C:\Users\revehiet\flip_water_addon\bin\windows-py313")
+from pathlib import Path
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "bin" / "windows-py313"))
 import flip_solver_core as core  # noqa: E402
 
 import bpy  # noqa: E402
 
-sys.path.insert(0, r"C:\Users\revehiet")
+sys.path.insert(0, str(_REPO_ROOT))
 import flip_water_addon  # noqa: E402
 flip_water_addon.register()
 print("addon registered from repo")

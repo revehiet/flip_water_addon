@@ -2,7 +2,9 @@
 import sys
 import numpy as np
 
-sys.path.insert(0, r"C:\Users\revehiet\flip_water_addon\bin\windows-py313")
+from pathlib import Path
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "bin" / "windows-py313"))
 import flip_solver_core as core
 
 print("openvdb_enabled:", core.openvdb_enabled,

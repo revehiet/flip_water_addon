@@ -18,8 +18,20 @@ if hasattr(os, "add_dll_directory") and os.path.isdir(cuda_root):
         print("Adding DLL dir:", cb)
         os.add_dll_directory(cb)
 
-pyd = r"C:\Users\revehiet\AppData\Roaming\Blender Foundation\Blender\5.2\extensions\user_default\flip_water_addon\bin\windows-py313\flip_solver_core.cp313-win_amd64.pyd"
-print("PYD exists:", os.path.isfile(pyd))
+# Locate the *installed* copy of the addon under Blender's extensions dir,
+# scanning all installed Blender versions rather than hardcoding one.
+_ext_root = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
+                         "Blender Foundation", "Blender")
+pyd = None
+if os.path.isdir(_ext_root):
+    for ver in sorted(os.listdir(_ext_root), reverse=True):
+        cand = os.path.join(
+            _ext_root, ver, "extensions", "user_default", "flip_water_addon",
+            "bin", "windows-py313", "flip_solver_core.cp313-win_amd64.pyd")
+        if os.path.isfile(cand):
+            pyd = cand
+            break
+print("PYD exists:", pyd is not None, pyd or "")
 import importlib.util
 try:
     spec = importlib.util.spec_from_file_location("flip_solver_core", pyd)

@@ -13,7 +13,9 @@ import numpy as np
 
 import bpy
 
-sys.path.insert(0, r"C:\Users\revehiet")
+from pathlib import Path
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT))
 import flip_water_addon  # noqa: E402
 flip_water_addon.register()
 print("addon registered from repo")

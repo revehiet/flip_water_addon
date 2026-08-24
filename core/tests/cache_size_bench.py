@@ -8,12 +8,16 @@ import time
 import numpy as np
 
 # Load cache_io directly (its package __init__ imports bpy, unavailable here).
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 _spec = importlib.util.spec_from_file_location(
-    "cache_io", r"C:\Users\revehiet\flip_water_addon\cache_io.py")
+    "cache_io", str(_REPO_ROOT / "cache_io.py"))
 cache_io = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cache_io)
 
-BASE = r"C:\Temp\cache_size_bench"
+BASE = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")),
+                    "flip_water_cache_size_bench")
 
 rng = np.random.default_rng(7)
 N = 50000
