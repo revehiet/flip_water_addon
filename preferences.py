@@ -1,0 +1,75 @@
+import sys
+import bpy
+from bpy.types import AddonPreferences
+from bpy.props import StringProperty
+
+from . import solver_bridge
+
+
+class FLIPWATER_AddonPreferences(AddonPreferences):
+    bl_idname = __package__
+
+    build_python_executable: StringProperty(
+        name="Build Python Executable",
+        description=(
+            "Path to a standalone Python interpreter matching this Blender's "
+            "bundled Python version, used ONLY to compile the solver (Blender's "
+            "own bundled Python cannot compile C extensions - it ships without "
+            "development headers). Install a matching version from python.org "
+            "and point this at its python/python.exe"
+        ),
+        subtype='FILE_PATH',
+        default="",
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        needed = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+        box = layout.box()
+        col = box.column()
+        col.label(text=f"This Blender is running Python {needed}.{sys.version_info.micro}", icon='INFO')
+
+        module, err = solver_bridge.load()
+        if module is not None:
+            col.label(text="FLIP solver core: loaded ✓", icon='CHECKMARK')
+            if getattr(module, "openmp_enabled", False):
+                threads = getattr(module, "openmp_max_threads", 1)
+                col.label(text=f"CPU (OpenMP): {threads} threads ✓", icon='CHECKMARK')
+            if getattr(module, "cuda_enabled", False):
+                col.label(text="GPU (CUDA): enabled ✓", icon='CHECKMARK')
+
+        layout.separator()
+        layout.prop(self, "build_python_executable")
+        row = layout.row()
+        row.scale_y = 1.3
+        if module is not None:
+            row.label(text="Solver is ready — no build needed", icon='CHECKMARK')
+        else:
+            row.operator("flip_water.build_solver", icon='SETTINGS')
+
+        row = layout.row()
+        row.scale_y = 1.1
+        row.operator("flip_water.reload_scripts", icon='FILE_REFRESH')
+
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="Setup steps:")
+        col.label(text=f"1. Install a standalone Python {needed}.x (python.org) matching this Blender.")
+        col.label(text="2. Point 'Build Python Executable' above at it.")
+        col.label(text="3. Click 'Build FLIP Solver' (needs a C++ compiler + CMake on your system).")
+        col.label(text="4. Add a FLIP Domain from the 3D Viewport's 'Add > Mesh' menu, or the sidebar panel.")
+        col.label(text="5. During development, use 'Reload Addon Scripts' after Python edits (no reinstall needed).")
+
+
+_CLASSES = (FLIPWATER_AddonPreferences,)
+
+
+def register():
+    for cls in _CLASSES:
+        bpy.utils.register_class(cls)
+
+
+def unregister():
+    for cls in reversed(_CLASSES):
+        bpy.utils.unregister_class(cls)

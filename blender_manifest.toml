@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+id = "flip_water_addon"
+version = "0.1.0"
+name = "FLIP Water Simulation (C++ Core)"
+tagline = "FLIP water simulation with a compiled C++ solver core"
+maintainer = "FLIP Water Addon"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:MIT"]
+tags = ["Physics"]
+website = "https://github.com/revehiet/flip_water_addon"
+copyright = ["2026 FLIP Water Addon"]
+# Optional HDF5 caching: Blender installs this wheel outside the extension
+# directory on install, so `import h5py` works without policy warnings.
+wheels = ["./wheels/h5py-3.16.0-cp313-cp313-win_amd64.whl"]

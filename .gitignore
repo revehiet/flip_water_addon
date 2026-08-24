@@ -1,0 +1,14 @@
+core/build/
+bin/
+__pycache__/
+*.pyc
+*.so
+*.pyd
+flip_cache/
+# Local environments / staging artifacts never belong in the repo
+.venv/
+dist/
+_wheel_probe/
+*.zip
+.vscode/
+
