@@ -52,6 +52,7 @@ class WakeState:
     prev_collider_center: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
     has_prev:   bool = False
     params:     WakeParams = field(default_factory=WakeParams)
+    emit_credit: float = 0.0   # fractional particles owed (see _substep)
 
 
 # Module-level storage: key = (tree_name, node_name)
@@ -197,10 +198,16 @@ def _substep(state: WakeState, collider_pts: np.ndarray, surface_z: float, dt: f
     if state.params.emission_mode == "CRESTS":
         _emit_kelvin_crests(state, center, vel, speed, direction, dt)
     else:
-        n_emit = max(2, int(speed * dt * 10.0))  # scale with speed
-        n_emit = min(n_emit, 200)
+        # Emission scales with distance travelled: a stationary object sheds
+        # no wake, faster objects shed proportionally more. At typical speeds
+        # the rate is <1 particle per substep, so a credit accumulator banks
+        # the fraction until a whole particle is owed (60 particles per metre).
+        state.emit_credit += speed * dt * 60.0
+        state.emit_credit = min(state.emit_credit, 200.0)
+        n_emit = min(int(state.emit_credit), 200)
 
-        if n_emit > 0 and collider_pts.shape[0] > 0:
+        if n_emit > 0 and speed > 1e-4 and collider_pts.shape[0] > 0:
+            state.emit_credit -= float(n_emit)
             # Find trailing edge: points furthest behind relative to velocity.
             # <= (not <) so the minimum-projection points still qualify when
             # the 20th percentile equals the minimum (small point counts).
@@ -227,30 +234,47 @@ def _substep(state: WakeState, collider_pts: np.ndarray, surface_z: float, dt: f
 
     state.positions += state.velocities * dt
 
-    # Turbulence
-    _turb_x = np.sin(state.positions[:, 1] * 1.5 + state.time) * np.cos(state.positions[:, 0] * 1.2 + state.time)
-    _turb_y = np.cos(state.positions[:, 0] * 1.5 + state.time) * np.sin(state.positions[:, 1] * 1.2 - state.time)
-    state.velocities[:, 0] += _turb_x.astype(np.float32) * 0.3 * dt
-    state.velocities[:, 1] += _turb_y.astype(np.float32) * 0.3 * dt
+    # Turbulence (strength = amplitude, scale = spatial frequency of the pattern)
+    p = state.params
+    if p.turbulence_strength > 0.0:
+        fx = 1.0 * p.turbulence_scale
+        fy = 0.8 * p.turbulence_scale
+        _turb_x = np.sin(state.positions[:, 1] * fx + state.time) * np.cos(state.positions[:, 0] * fy + state.time)
+        _turb_y = np.cos(state.positions[:, 0] * fx + state.time) * np.sin(state.positions[:, 1] * fy - state.time)
+        state.velocities[:, 0] += (_turb_x * p.turbulence_strength).astype(np.float32) * dt
+        state.velocities[:, 1] += (_turb_y * p.turbulence_strength).astype(np.float32) * dt
 
-    # Drag
-    state.velocities *= (1.0 - 0.8 * dt)
+    # Drag (decay_rate = velocity damping per second); clamp so a large dt
+    # can't flip the sign of velocities.
+    state.velocities *= max(0.0, 1.0 - p.decay_rate * dt)
 
-    # Repulsion (approximate: push apart overlapping particles)
-    if n > 1:
+    # Repulsion pushes overlapping particles apart; clamping attracts nearby
+    # ones (cheap stand-in for surface tension). Approximate O(n^2), capped
+    # for performance. Both use their WakeParams strengths/radii.
+    if n > 1 and (p.repulsion_strength > 0.0 or p.clumping_strength > 0.0):
+        rep_r2 = p.repulsion_radius * p.repulsion_radius
+        clp_r2 = p.clumping_radius * p.clumping_radius
         for i in range(min(n, 500)):  # cap for performance
             dx = state.positions[i, 0] - state.positions[:, 0]
             dy = state.positions[i, 1] - state.positions[:, 1]
             d2 = dx*dx + dy*dy
-            close = (d2 < 0.09) & (d2 > 1e-12)
-            if close.any():
-                inv_d = 1.0 / np.sqrt(d2[close] + 1e-12)
-                f = 0.5 * (1.0 - np.sqrt(d2[close]) / 0.3) * inv_d
-                state.velocities[i, 0] += np.sum(dx[close] * f) * dt
-                state.velocities[i, 1] += np.sum(dy[close] * f) * dt
+            if p.repulsion_strength > 0.0:
+                close = (d2 < rep_r2) & (d2 > 1e-12)
+                if close.any():
+                    dist = np.sqrt(d2[close])
+                    f = p.repulsion_strength * (1.0 - dist / p.repulsion_radius) / (dist + 1e-12)
+                    state.velocities[i, 0] += np.sum(dx[close] * f) * dt
+                    state.velocities[i, 1] += np.sum(dy[close] * f) * dt
+            if p.clumping_strength > 0.0:
+                near = (d2 < clp_r2) & (d2 > 1e-6)
+                if near.any():
+                    dist = np.sqrt(d2[near])
+                    f = p.clumping_strength * (1.0 - dist / p.clumping_radius) / (dist + 1e-12)
+                    state.velocities[i, 0] -= np.sum(dx[near] * f) * dt
+                    state.velocities[i, 1] -= np.sum(dy[near] * f) * dt
 
-    # Age
-    aging = 1.0 / max(3.0, 0.01)
+    # Age (lifetime drives the aging rate: age reaches 1.0 after `lifetime` s)
+    aging = 1.0 / max(p.lifetime, 0.01)
     state.ages += aging * dt
 
     # Remove dead
