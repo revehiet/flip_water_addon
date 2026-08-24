@@ -4,22 +4,21 @@ A Blender addon that simulates water using the **FLIP** (FLuid-Implicit-Particle
 method. The simulation itself runs in a compiled **C++ core** (exposed to
 Python via [pybind11](https://github.com/pybind/pybind11)) for speed; the
 Python side is just orchestration, caching, and UI. Surface reconstruction
-(turning particles into a smooth water mesh) is handled by
-[pysplashsurf](https://github.com/InteractiveComputerGraphics/splashsurf), an
-SPH-aware marching-cubes implementation bundled with the addon as a wheel,
-so the mesh actually follows the fluid's surface tension/splashes instead of
-a generic volumetric blob, without any manual dependency install step.
+(turning particles into a smooth water mesh) is done by a native **OpenVDB**
+level-set mesher baked into that same C++ core, with an optional CUDA GPU
+marching-cubes mesher as a faster alternative — no external Python
+dependencies are required.
 
-to be built once for your machine (see "Setup"). `pysplashsurf` is likewise
 This whole folder is the addon — install it as-is (see below). It also
 contains its own C++ source and build scripts, since the compiled core has
-to be built once for your machine (see "Setup"). Surface reconstruction is
-bundled as a prebuilt `pysplashsurf` wheel and auto-loaded on supported
-platforms, so there is no separate manual dependency install step.
+to be built once for your machine (see "Setup").
 
 - Minimum Blender version: **4.2**. Tested against the current Blender
   release line (5.x).
 - Platforms: Windows, macOS, Linux (build once per platform/Python version).
+  Note that the one *prebuilt* bundled wheel (`h5py`, used only for optional
+  HDF5 session export) targets Windows / Python 3.13; elsewhere the addon
+  simply runs without HDF5 export — everything else builds from source.
 
 ## Why a build step? (read this before reporting "it doesn't work")
 
@@ -69,8 +68,8 @@ python3.11 scripts/build_solver.py      # replace 3.11 with your version
 # or:  ./scripts/build.sh /path/to/python3.11
 
 # Windows (PowerShell / cmd)
-C:\Users\Hamza\AppData\Local\Programs\Python\Python313\python.exe scripts\build_solver.py
-:: or:  scripts\build.bat C:\Python311\python.exe
+C:\Path\To\Your\Python313\python.exe scripts\build_solver.py   # any standalone Python matching Blender's
+:: or:  scripts\build.bat C:\Path\To\Python311\python.exe
 ```
 
 This configures and builds the C++ core with CMake, and drops the compiled
@@ -118,7 +117,7 @@ Water** tab.
 6. To get a meshed water surface (instead of just the particle overlay),
    wire a **Particle Fluid Surface** node up to your Solver/Cache and either
    **Reconstruct** a single frame or **Bake Surface** the whole range through
-   the Cache node — this runs `pysplashsurf` per frame and writes a mesh
+   the Cache node — this runs the core's native mesher per frame and writes a mesh
    cache to disk (`flip_cache/.../surface/`), so scrubbing the timeline
    afterwards just loads the cached mesh instead of re-running the solver.
    Tweak **Particle Radius Scale**, **Smoothing Length**, **Cube Size
@@ -142,7 +141,7 @@ core/                    C++ FLIP solver (the actual physics)
   properties.py            Domain/Emitter/Obstacle settings (bpy PropertyGroups)
   voxelize.py              Mesh -> particle seed points / solid mask (BVH ray-casts)
   cache_io.py              Simple per-frame binary particle cache (.fwc files)
-  surface_reconstruction.py  Lazy wrapper around pysplashsurf (particles -> mesh)
+  surface_reconstruction.py  Particles -> mesh via the core's native OpenVDB/GPU mesher
   operators.py             Add Domain/Emitter/Obstacle, Bake (modal), Free, Build Solver
   panels.py                Sidebar UI
   handlers.py              Updates the cached points on frame change (playback)
@@ -214,13 +213,13 @@ MIT — see `LICENSE`. Do whatever you like with it.
 
 ## Changelog
 
-- **Real fluid-surface reconstruction via pysplashsurf.** The old "Surface
+- **Real fluid-surface reconstruction.** The old "Surface
   Reconstruction" node relied on Blender's native Points-to-Volume/Volume-to-Mesh
   Geometry Nodes and an internal `<domain>_flip_points` object that no longer
   exists (particle display is overlay-only now), so it was completely
   non-functional. It's been replaced with a real SPH-aware surface
-  reconstruction pipeline built on
-  [pysplashsurf](https://github.com/InteractiveComputerGraphics/splashsurf),
+  reconstruction pipeline (initially via pysplashsurf, nowadays the native
+  OpenVDB / CUDA-GPU meshers built into the C++ core),
   renamed to **Particle Fluid Surface**, with new tuning properties (Particle
   Radius Scale, Smoothing Length, Cube Size Scale, Surface Threshold, Mesh
   Smoothing Iterations, Mesh Cleanup). Surface playback now updates live from
@@ -350,8 +349,8 @@ documented trade-off, not an oversight):
 - **No two-phase / variable-density projection** - this addon is free-surface
   water only, matching its scope before this change.
 - **No custom surface reconstruction/denoising** (the paper's mean-curvature-
-  flow smoothing) - we already reconstruct the render surface via
-  `pysplashsurf`'s SPH-aware marching cubes + Laplacian mesh smoothing
+  flow smoothing) - we already reconstruct the render surface via the core's
+  native OpenVDB level-set mesher (or the CUDA GPU marching-cubes mesher)
   (the **Particle Fluid Surface** node), which serves the same "turn noisy
   particles into a clean surface" role.
 - Spatial P2G kernel is unchanged (existing trilinear), not upgraded to the
