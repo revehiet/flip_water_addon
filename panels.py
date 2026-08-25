@@ -51,7 +51,8 @@ def node_params_in_npanel():
 
 
 # Compact stub width used while parameters live in the N-panel.
-_NPNODE_STUB_WIDTH = 100
+# (Matches the Merge node's width — the slimmest look in the graph.)
+_NPNODE_STUB_WIDTH = 140
 _FW_NODE_INLINE_WIDTH = {}
 
 
