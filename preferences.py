@@ -1,9 +1,21 @@
 import sys
 import bpy
 from bpy.types import AddonPreferences
-from bpy.props import StringProperty
+from bpy.props import BoolProperty, StringProperty
 
 from . import solver_bridge
+
+
+def _tag_node_editors_redraw(_self, _context):
+    """Preference update callback: refresh every node editor so the
+    N-panel / on-node parameter switch takes effect immediately."""
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'NODE_EDITOR':
+                    area.tag_redraw()
+    except Exception:  # noqa: BLE001 - redraw is best-effort
+        pass
 
 
 class FLIPWATER_AddonPreferences(AddonPreferences):
@@ -20,6 +32,17 @@ class FLIPWATER_AddonPreferences(AddonPreferences):
         ),
         subtype='FILE_PATH',
         default="",
+    )
+
+    node_params_in_npanel: BoolProperty(
+        name="Node Params in N-Panel",
+        description=(
+            "A/B experiment: draw node parameters and action buttons in the "
+            "node editor's N-panel ('FLIP Water' category) instead of on the "
+            "node bodies, leaving the nodes as pure input/output stubs"
+        ),
+        default=False,
+        update=_tag_node_editors_redraw,
     )
 
     def draw(self, context):
@@ -51,6 +74,11 @@ class FLIPWATER_AddonPreferences(AddonPreferences):
         row = layout.row()
         row.scale_y = 1.1
         row.operator("flip_water.reload_scripts", icon='FILE_REFRESH')
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="Interface", icon='WINDOW')
+        box.prop(self, "node_params_in_npanel")
 
         layout.separator()
         col = layout.column(align=True)

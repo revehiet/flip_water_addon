@@ -32,6 +32,65 @@ def _get_tree_and_node(tree_name, node_name):
     return tree, tree.nodes.get(node_name)
 
 
+_WAKE_NODE_IDS = {
+    "WakeObjectGeometryInputNode",
+    "WakeWakeSolverNode",
+    "WakeCacheNode",
+    "WakeDrawPointsNode",
+}
+
+
+def node_params_in_npanel():
+    """True when the addon-preferences A/B switch routes node parameters
+    and action buttons to the node editor's N-panel."""
+    try:
+        prefs = bpy.context.preferences.addons[__package__].preferences
+        return bool(prefs.node_params_in_npanel)
+    except Exception:  # noqa: BLE001 - preferences may be mid-(re)load
+        return False
+
+
+def _active_fw_node(context):
+    """Pinned node if pinned, else active node — None if not ours."""
+    space = getattr(context, "space_data", None)
+    node = getattr(space, "node", None) if space is not None else None
+    if node is None:
+        node = getattr(context, "active_node", None)
+    if node is None:
+        return None
+    bid = getattr(node, "bl_idname", "")
+    if bid.startswith("FLIPWATER_ND_") or bid in _WAKE_NODE_IDS:
+        return node
+    return None
+
+
+class FLIPWATER_PT_node_params(bpy.types.Panel):
+    """N-panel host for node parameters/actions (see the addon preference
+    'Node Params in N-Panel'). One generic panel serves every addon node;
+    rendering itself comes from each node's _draw_params()."""
+    bl_space_type = 'NODE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "FLIP Water"
+    bl_label = "Node Parameters"
+
+    @classmethod
+    def poll(cls, context):
+        return _active_fw_node(context) is not None
+
+    def draw(self, context):
+        layout = self.layout
+        node = _active_fw_node(context)
+        if node is None:
+            return
+        row = layout.row(align=True)
+        row.label(text=node.bl_label, icon='NODE')
+        params = getattr(node, "_draw_params", None)
+        if params is None:
+            layout.label(text="This node has no parameters", icon='INFO')
+            return
+        params(context, layout.column())
+
+
 def _linked_nodes_from_input(node, input_name):
     sock = node.inputs.get(input_name)
     if sock is None:
@@ -1140,6 +1199,12 @@ class FLIPWATER_ND_domain(_FLIPWATER_NodeBase, bpy.types.Node):
         self.width = 320
 
     def draw_buttons(self, context, layout):
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(context, layout)
+
+    def _draw_params(self, context, layout):
         col = layout.column(align=True)
         col.prop(self, "domain_object", text="Object")
 
@@ -1177,6 +1242,12 @@ class FLIPWATER_ND_solver(_FLIPWATER_NodeBase, bpy.types.Node):
         _sync_tree_role_tags(self.id_data)
 
     def draw_buttons(self, _context, layout):
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(_context, layout)
+
+    def _draw_params(self, _context, layout):
         domain_node, _emitter_nodes, _tank_nodes, _obstacle_nodes, _sink_nodes = _resolve_solver_links(self)
         domain_obj = domain_node.domain_object if domain_node is not None else None
 
@@ -1227,6 +1298,12 @@ class FLIPWATER_ND_cache(_FLIPWATER_NodeBase, bpy.types.Node):
             self.cache_version = f"v{int(m.group(1)) + 1}"
 
     def draw_buttons(self, _context, layout):
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(_context, layout)
+
+    def _draw_params(self, _context, layout):
         stage, domain_obj, err = _resolve_cache_stage(self)
         if domain_obj is None:
             layout.label(text=err, icon='ERROR')
@@ -1397,6 +1474,12 @@ class FLIPWATER_ND_tank(_FLIPWATER_NodeBase, bpy.types.Node):
         _update_tank_overlay(self)
 
     def draw_buttons(self, _context, layout):
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(_context, layout)
+
+    def _draw_params(self, _context, layout):
         col = layout.column(align=True)
         col.prop(self, "enabled")
         col.prop(self, "tank_fill_height")
@@ -1420,6 +1503,12 @@ class FLIPWATER_ND_surface(_FLIPWATER_NodeBase, bpy.types.Node):
         self.width = 360
 
     def draw_buttons(self, _context, layout):
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(_context, layout)
+
+    def _draw_params(self, _context, layout):
         domain_obj, err = _resolve_surface_domain(self)
         if domain_obj is None:
             layout.label(text=err, icon='ERROR')
@@ -1506,6 +1595,12 @@ class FLIPWATER_ND_wake_deformer(_FLIPWATER_NodeBase, bpy.types.Node):
         return ntree.bl_idname in (TREE_IDNAME, "WakePointsTreeType")
 
     def draw_buttons(self, _context, layout):
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(_context, layout)
+
+    def _draw_params(self, _context, layout):
         col = layout.column(align=True)
         col.prop(self, "surface_object", text="Surface")
         col.prop(self, "collider_object", text="Collider")
@@ -1659,6 +1754,12 @@ class FLIPWATER_ND_mpm_solver(_FLIPWATER_NodeBase, bpy.types.Node):
         self.width = 380
 
     def draw_buttons(self, _context, layout):
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(_context, layout)
+
+    def _draw_params(self, _context, layout):
         domain_obj, err = _resolve_mpm_solver_domain(self)
         if domain_obj is not None:
             layout.label(text=f"Domain: {domain_obj.name}", icon='CUBE')
@@ -2009,6 +2110,12 @@ class FLIPWATER_ND_wake_solver(_FLIPWATER_NodeBase, bpy.types.Node):
         self.width = 380
 
     def draw_buttons(self, _context, layout):
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(_context, layout)
+
+    def _draw_params(self, _context, layout):
         box = layout.box()
         box.label(text="Objects", icon='OBJECT_DATA')
         box.prop(self, "wake_collider_object", text="Collider")
@@ -2068,6 +2175,12 @@ class FLIPWATER_ND_emitter(_FLIPWATER_NodeBase, bpy.types.Node):
             _safe_set(self.emitter_object, "flip_water_is_emitter", True)
 
     def draw_buttons(self, _context, layout):
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(_context, layout)
+
+    def _draw_params(self, _context, layout):
         col = layout.column(align=True)
         col.prop(self, "emitter_object", text="Object")
 
@@ -2097,6 +2210,12 @@ class FLIPWATER_ND_obstacle(_FLIPWATER_NodeBase, bpy.types.Node):
             _safe_set(self.obstacle_object, "flip_water_is_obstacle", True)
 
     def draw_buttons(self, _context, layout):
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(_context, layout)
+
+    def _draw_params(self, _context, layout):
         col = layout.column(align=True)
         col.prop(self, "obstacle_object", text="Object")
 
@@ -2152,6 +2271,12 @@ class FLIPWATER_ND_sink(_FLIPWATER_NodeBase, bpy.types.Node):
             _safe_set(self.sink_object, "flip_water_is_sink", True)
 
     def draw_buttons(self, _context, layout):
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(_context, layout)
+
+    def _draw_params(self, _context, layout):
         col = layout.column(align=True)
         col.prop(self, "sink_object", text="Object")
 
@@ -2198,6 +2323,7 @@ if NodeCategory is not None:
 
 
 _CLASSES = (
+    FLIPWATER_PT_node_params,
     FLIPWATER_OT_node_assign_role,
     FLIPWATER_OT_node_create_domain,
     FLIPWATER_OT_node_free_domain,

@@ -114,6 +114,13 @@ class ObjectGeometryInputNode(WakeNodeBase):
         self.width = 240
 
     def draw_buttons(self, context, layout):
+        from .panels import node_params_in_npanel
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(context, layout)
+
+    def _draw_params(self, context, layout):
         layout.prop(self, "source_object", text="")
 
     def evaluate(self, context, inputs):
@@ -227,6 +234,13 @@ class WakeSolverNode(WakeNodeBase):
         self.width = 360
 
     def draw_buttons(self, context, layout):
+        from .panels import node_params_in_npanel
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(context, layout)
+
+    def _draw_params(self, context, layout):
         box = layout.box()
         box.label(text="Emission", icon='PARTICLES')
         live = _linked_deformer(self)
@@ -455,6 +469,13 @@ class CacheNode(WakeNodeBase):
         self.width = 280
 
     def draw_buttons(self, context, layout):
+        from .panels import node_params_in_npanel
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(context, layout)
+
+    def _draw_params(self, context, layout):
         layout.prop(self, "store_history")
         if self.store_history:
             layout.prop(self, "max_frames")
@@ -505,6 +526,13 @@ class DrawPointsNode(WakeNodeBase):
         self.width = 240
 
     def draw_buttons(self, context, layout):
+        from .panels import node_params_in_npanel
+        if node_params_in_npanel():
+            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            return
+        self._draw_params(context, layout)
+
+    def _draw_params(self, context, layout):
         layout.prop(self, "point_size")
         layout.prop(self, "color")
 
