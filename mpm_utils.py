@@ -29,14 +29,17 @@ def box_max(origin, res, stride):
 
 
 def build_block_seeds(origin, res, stride, fill_xy=0.5, fill_z=0.4,
-                      per_cell_axis=2, seed=12345, jitter=0.1):
+                      per_cell_axis=2, seed=12345, jitter=0.45):
     """Initial-particle block: centered footprint resting on the domain floor.
 
     Spacing is stride/per_cell_axis so the particle volume matches the
-    solver's (h/2)^3 calibration (2 particles per axis = 8 per cell). The
-    result is guaranteed strictly inside the boundary box — seeds outside get
-    clamped onto the box walls by the advection kernel, which is the artifact
-    this helper exists to prevent.
+    solver's (h/2)^3 calibration (2 particles per axis = 8 per cell).
+    Alternate Z layers are staggered half a step in X (BCC-flavoured) and the
+    jitter is a substantial fraction of the spacing — a pure axis-aligned
+    lattice with tiny jitter columnizes under gravity and shows strong
+    grid-aligned striations in orthographic views. The result is guaranteed
+    strictly inside the boundary box (seeds outside get clamped onto the box
+    walls by the advection kernel).
     """
     ox, oy, oz = (float(v) for v in origin)
     rx, ry, rz = (int(v) for v in res)
@@ -61,6 +64,13 @@ def build_block_seeds(origin, res, stride, fill_xy=0.5, fill_z=0.4,
     xs, ys, zs = axis_points(x0, x0 + span_x), axis_points(y0, y0 + span_y), \
         axis_points(z0, z1)
     X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+
+    # BCC-flavoured stagger: shift alternate Z layers half a step in X so
+    # vertical neighbour columns break up instead of persisting as stripes.
+    if zs.size > 1:
+        parity = (np.arange(zs.size) % 2).astype(np.float64)[None, None, :]
+        X = X + parity * (step * 0.5)
+
     pts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1).astype(np.float32)
 
     if jitter > 0.0:

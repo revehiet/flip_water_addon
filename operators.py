@@ -547,10 +547,13 @@ def refresh_surface_preview(context, domain_obj, frame):
 
     props = domain_obj.flip_water_domain
     if not _domain_has_surface_node(domain_obj):
+        # Dataflow semantics: no connected Fluid Mesher node -> no surface.
+        # Remove the object outright instead of just hiding it.
         obj = props.surface_object
         if obj is not None and obj.name in bpy.data.objects:
-            obj.hide_viewport = True
-            obj.hide_render = True
+            bpy.data.objects.remove(obj, do_unlink=True)
+        props.surface_object = None
+        _surface_preview_state.pop(domain_obj.name, None)
         return False
 
     if props.is_surface_baked:
@@ -1030,7 +1033,7 @@ def build_seed_preview_points(context, domain_obj, emitter_objs, tank_specs):
         eprops = emitter.flip_water_emitter
         if not eprops.enabled:
             continue
-        seed = _stable_seed(domain_obj.name, emitter.name, frame) if getattr(eprops, "reseed", False) else 12345
+        seed = 12345
         lattice = getattr(props, "seeding_lattice", "AA")
         if eprops.sampling_mode == 'MESH':
             pts = voxelize.sample_points_mesh(depsgraph, emitter, cell_size, props.particles_per_cell, seed=seed, lattice=lattice)
@@ -1944,7 +1947,7 @@ class FLIPWATER_OT_bake(bpy.types.Operator):
             if not eprops.animated and emitter.name in self._emitter_seed_cache:
                 pts = self._emitter_seed_cache[emitter.name]
             else:
-                seed = _stable_seed(domain.name, emitter.name, frame) if getattr(eprops, "reseed", False) else 12345
+                seed = 12345
                 lattice = getattr(props, "seeding_lattice", "AA")
                 if eprops.sampling_mode == 'MESH':
                     pts = voxelize.sample_points_mesh(self._depsgraph, emitter, cell_size, props.particles_per_cell, seed=seed, lattice=lattice)

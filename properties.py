@@ -99,26 +99,30 @@ def _refresh_obstacle_preview(self, context):
 _FLIP_PRESETS = {
     'WATER': dict(
         density=1000.0, flip_ratio=0.95,
-        gravity=(0.0, 0.0, -9.81), cfl_number=8.0),
+        gravity=(0.0, 0.0, -9.81), cfl_number=8.0,
+        viscosity_strength=0.0, surface_tension_strength=0.0),
     'HONEY': dict(
         density=1400.0, flip_ratio=0.05,
-        gravity=(0.0, 0.0, -9.81), cfl_number=4.0),
+        gravity=(0.0, 0.0, -9.81), cfl_number=4.0,
+        viscosity_strength=0.9, surface_tension_strength=10.0),
     'LAVA': dict(
         density=2600.0, flip_ratio=0.5,
-        gravity=(0.0, 0.0, -9.81), cfl_number=4.0),
+        gravity=(0.0, 0.0, -9.81), cfl_number=4.0,
+        viscosity_strength=0.6, surface_tension_strength=20.0),
     'SPLASH': dict(
         density=1000.0, flip_ratio=1.0,
-        gravity=(0.0, 0.0, -9.81), cfl_number=8.0),
+        gravity=(0.0, 0.0, -9.81), cfl_number=8.0,
+        viscosity_strength=0.0, surface_tension_strength=0.0),
     'ZERO_G': dict(
         density=1000.0, flip_ratio=0.95,
-        gravity=(0.0, 0.0, 0.0), cfl_number=8.0),
+        gravity=(0.0, 0.0, 0.0), cfl_number=8.0,
+        viscosity_strength=0.0, surface_tension_strength=40.0),
 }
 
 
 def _apply_flip_preset(self, context):
-    """Enum update callback: applies a liquid preset's material settings.
-    Our FLIP solver has no viscosity term, so thicker liquids are emulated
-    with PIC-leaning FLIP ratios (0 = pure PIC = heavily damped motion)."""
+    """Enum update callback: applies a liquid preset's material settings
+    (density, FLIP/PIC blend, gravity, CFL, viscosity, surface tension)."""
     preset = _FLIP_PRESETS.get(self.flip_preset)
     if preset is None:
         return
@@ -127,6 +131,10 @@ def _apply_flip_preset(self, context):
     self.gravity_override = True
     self.gravity = preset["gravity"]
     self.cfl_number = preset["cfl_number"]
+    if "viscosity_strength" in preset:
+        self.viscosity_strength = preset["viscosity_strength"]
+    if "surface_tension_strength" in preset:
+        self.surface_tension_strength = preset["surface_tension_strength"]
 
 
 class FLIPWATER_DomainSettings(PropertyGroup):
@@ -656,11 +664,6 @@ class FLIPWATER_EmitterSettings(PropertyGroup):
             ('MESH', "Mesh Volume", "Accurate: seed particles only inside the emitter's actual mesh volume (requires a closed/manifold mesh)"),
         ],
         default='MESH',
-    )
-    reseed: BoolProperty(
-        name="Re-seed",
-        description="Resample the emitter seed pattern each frame instead of reusing the same particle layout",
-        default=False,
     )
     enabled: BoolProperty(name="Enabled", default=True)
     animated: BoolProperty(

@@ -1538,7 +1538,7 @@ class FLIPWATER_ND_tank(_FLIPWATER_NodeBase, bpy.types.Node):
 
 class FLIPWATER_ND_surface(_FLIPWATER_NodeBase, bpy.types.Node):
     bl_idname = "FLIPWATER_ND_surface"
-    bl_label = "Particle Fluid Surface"
+    bl_label = "Fluid Mesher"
 
     def init(self, _context):
         self.inputs.new("FLIPWATER_NodeSocket", "Particles")

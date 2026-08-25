@@ -85,6 +85,14 @@ def flip_water_depsgraph_update(scene, depsgraph=None):
     operators.sync_seed_previews_from_node_graph(bpy.context)
     operators.sync_mpm_seed_previews_from_node_graph(bpy.context)
     panels.apply_npanel_node_widths()
+    # Fluid Mesher dataflow: (re)generate live surfaces the moment a Surface
+    # node is added/connected — no scrub or manual Reconstruct needed.
+    for obj in scene.objects:
+        if obj.flip_water_is_domain:
+            dprops = obj.flip_water_domain
+            if not dprops.is_baking and not dprops.is_surface_baked:
+                operators.refresh_surface_preview(bpy.context, obj,
+                                                  scene.frame_current)
     panels.refresh_all_tank_overlays()
     _seed_new_node_trees()
 
