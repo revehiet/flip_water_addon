@@ -84,6 +84,7 @@ def flip_water_depsgraph_update(scene, depsgraph=None):
     _check_obstacle_transforms(scene)
     operators.sync_seed_previews_from_node_graph(bpy.context)
     operators.sync_mpm_seed_previews_from_node_graph(bpy.context)
+    panels.apply_npanel_node_widths()
     panels.refresh_all_tank_overlays()
     _seed_new_node_trees()
 

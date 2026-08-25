@@ -75,6 +75,24 @@ def _update_node_width_for_mode(node):
         pass
 
 
+def apply_npanel_node_widths():
+    """Force stub/inline widths onto every addon node.
+
+    Called from the preference toggle and the depsgraph handler — NOT from
+    draw_buttons, where assignments to node.width are clobbered by the node
+    layout pass's own write-back and never stick.
+    """
+    try:
+        on = node_params_in_npanel()
+    except Exception:  # noqa: BLE001 - preferences may be mid-(re)load
+        return
+    for tree in bpy.data.node_groups:
+        if tree.bl_idname not in (TREE_IDNAME, "WakePointsTreeType"):
+            continue
+        for node in tree.nodes:
+            _update_node_width_for_mode(node)
+
+
 def _active_fw_node(context):
     """Pinned node if pinned, else active node — None if not ours."""
     space = getattr(context, "space_data", None)

@@ -70,6 +70,20 @@ def test_gates_have_no_invalid_icon_and_use_width_hook():
         f"width hook missing from some gates ({total_hooks}/15)")
 
 
+def test_width_application_wired_outside_draw_pass():
+    """node.width assignments inside draw_buttons are clobbered by the node
+    layout pass, so the width application must be invoked from the
+    preference toggle and the depsgraph handler instead."""
+    panels = (_ROOT / "panels.py").read_text(encoding="utf-8")
+    prefs = (_ROOT / "preferences.py").read_text(encoding="utf-8")
+    handlers = (_ROOT / "handlers.py").read_text(encoding="utf-8")
+    assert "def apply_npanel_node_widths" in panels
+    assert "apply_npanel_node_widths" in prefs, \
+        "preference toggle must apply widths"
+    assert "panels.apply_npanel_node_widths()" in handlers, \
+        "depsgraph handler must apply widths"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in tests:

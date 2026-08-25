@@ -10,6 +10,12 @@ def _tag_node_editors_redraw(_self, _context):
     """Preference update callback: refresh every node editor so the
     N-panel / on-node parameter switch takes effect immediately."""
     try:
+        from . import panels
+        if hasattr(panels, "apply_npanel_node_widths"):
+            panels.apply_npanel_node_widths()
+    except Exception:  # noqa: BLE001 - panels may be mid-(re)load
+        pass
+    try:
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
                 if area.type == 'NODE_EDITOR':
