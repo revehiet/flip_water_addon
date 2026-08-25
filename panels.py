@@ -51,7 +51,7 @@ def node_params_in_npanel():
 
 
 # Compact stub width used while parameters live in the N-panel.
-_NPNODE_STUB_WIDTH = 50
+_NPNODE_STUB_WIDTH = 100
 _FW_NODE_INLINE_WIDTH = {}
 
 
@@ -1225,7 +1225,6 @@ class FLIPWATER_ND_domain(_FLIPWATER_NodeBase, bpy.types.Node):
     def draw_buttons(self, context, layout):
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(context, layout)
 
@@ -1269,7 +1268,6 @@ class FLIPWATER_ND_solver(_FLIPWATER_NodeBase, bpy.types.Node):
     def draw_buttons(self, _context, layout):
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(_context, layout)
 
@@ -1326,7 +1324,6 @@ class FLIPWATER_ND_cache(_FLIPWATER_NodeBase, bpy.types.Node):
     def draw_buttons(self, _context, layout):
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(_context, layout)
 
@@ -1503,7 +1500,6 @@ class FLIPWATER_ND_tank(_FLIPWATER_NodeBase, bpy.types.Node):
     def draw_buttons(self, _context, layout):
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(_context, layout)
 
@@ -1533,7 +1529,6 @@ class FLIPWATER_ND_surface(_FLIPWATER_NodeBase, bpy.types.Node):
     def draw_buttons(self, _context, layout):
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(_context, layout)
 
@@ -1626,7 +1621,6 @@ class FLIPWATER_ND_wake_deformer(_FLIPWATER_NodeBase, bpy.types.Node):
     def draw_buttons(self, _context, layout):
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(_context, layout)
 
@@ -1786,7 +1780,6 @@ class FLIPWATER_ND_mpm_solver(_FLIPWATER_NodeBase, bpy.types.Node):
     def draw_buttons(self, _context, layout):
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(_context, layout)
 
@@ -2143,7 +2136,6 @@ class FLIPWATER_ND_wake_solver(_FLIPWATER_NodeBase, bpy.types.Node):
     def draw_buttons(self, _context, layout):
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(_context, layout)
 
@@ -2209,7 +2201,6 @@ class FLIPWATER_ND_emitter(_FLIPWATER_NodeBase, bpy.types.Node):
     def draw_buttons(self, _context, layout):
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(_context, layout)
 
@@ -2245,7 +2236,6 @@ class FLIPWATER_ND_obstacle(_FLIPWATER_NodeBase, bpy.types.Node):
     def draw_buttons(self, _context, layout):
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(_context, layout)
 
@@ -2307,7 +2297,6 @@ class FLIPWATER_ND_sink(_FLIPWATER_NodeBase, bpy.types.Node):
     def draw_buttons(self, _context, layout):
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(_context, layout)
 

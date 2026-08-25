@@ -56,12 +56,15 @@ def test_npanel_panel_registered():
 
 def test_gates_have_no_invalid_icon_and_use_width_hook():
     """The original gate used icon='UI' (not a valid enum -> crash) and the
-    compact-stub width hook must be present in every gate."""
+    compact-stub width hook must be present in every gate. The on-node hint
+    label was removed later (it forced Blender's minimum node width up)."""
     total_hooks = 0
     for relpath in ("panels.py", "nodes_wake.py"):
         text = (_ROOT / relpath).read_text(encoding="utf-8")
         assert ", icon='UI')" not in text, \
             f"{relpath}: invalid icon='UI' still present"
+        assert "Params & actions" not in text, \
+            f"{relpath}: on-node hint label must stay removed"
         total_hooks += text.count("_update_node_width_for_mode(self)")
     assert total_hooks >= 15, (
         f"width hook missing from some gates ({total_hooks}/15)")

@@ -118,7 +118,6 @@ class ObjectGeometryInputNode(WakeNodeBase):
                              node_params_in_npanel)
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(context, layout)
 
@@ -240,7 +239,6 @@ class WakeSolverNode(WakeNodeBase):
                              node_params_in_npanel)
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(context, layout)
 
@@ -477,7 +475,6 @@ class CacheNode(WakeNodeBase):
                              node_params_in_npanel)
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(context, layout)
 
@@ -536,7 +533,6 @@ class DrawPointsNode(WakeNodeBase):
                              node_params_in_npanel)
         _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(context, layout)
 
