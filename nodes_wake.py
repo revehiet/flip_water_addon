@@ -114,9 +114,11 @@ class ObjectGeometryInputNode(WakeNodeBase):
         self.width = 240
 
     def draw_buttons(self, context, layout):
-        from .panels import node_params_in_npanel
+        from .panels import (_update_node_width_for_mode,
+                             node_params_in_npanel)
+        _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(context, layout)
 
@@ -234,9 +236,11 @@ class WakeSolverNode(WakeNodeBase):
         self.width = 360
 
     def draw_buttons(self, context, layout):
-        from .panels import node_params_in_npanel
+        from .panels import (_update_node_width_for_mode,
+                             node_params_in_npanel)
+        _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(context, layout)
 
@@ -469,9 +473,11 @@ class CacheNode(WakeNodeBase):
         self.width = 280
 
     def draw_buttons(self, context, layout):
-        from .panels import node_params_in_npanel
+        from .panels import (_update_node_width_for_mode,
+                             node_params_in_npanel)
+        _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(context, layout)
 
@@ -526,9 +532,11 @@ class DrawPointsNode(WakeNodeBase):
         self.width = 240
 
     def draw_buttons(self, context, layout):
-        from .panels import node_params_in_npanel
+        from .panels import (_update_node_width_for_mode,
+                             node_params_in_npanel)
+        _update_node_width_for_mode(self)
         if node_params_in_npanel():
-            layout.label(text="Params & actions → N-panel ▸", icon='UI')
+            layout.label(text="Params & actions → N-panel ▸")
             return
         self._draw_params(context, layout)
 
