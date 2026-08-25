@@ -2812,9 +2812,9 @@ class FLIPWATER_OT_bake_mpm(bpy.types.Operator):
         positions, (origin, res), source = compute_mpm_initial_particles(
             context, node)
         from . import mpm_utils
+        box_hi = mpm_utils.box_max(origin, res, float(node.mpm_grid_stride))
         print(f"[MPM] Seeded {positions.shape[0]} particles ({source}); "
-              f"boundary box {origin} → "
-              f"{mpm_utils.box_max(origin, res)}")
+              f"boundary box {origin} → {box_hi}")
         return positions
 
     def _domain_object(self):
