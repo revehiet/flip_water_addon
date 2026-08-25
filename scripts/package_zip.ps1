@@ -26,7 +26,8 @@ Get-ChildItem -Path $root -Force | ForEach-Object {
             Where-Object {
                 $full = $_.FullName
                 ($full -notlike '*\core\build\*') -and
-                ($_.PSIsContainer -or ($excludeFiles -notcontains $_.Extension))
+                ($full -notlike '*\__pycache__\*') -and
+                ($_.PSIsContainer -or ($_.Extension -notin @('.pyc', '.pyo', '.zip', '.whl')))
             } |
             ForEach-Object {
                 $rel = $_.FullName.Substring((Join-Path $root 'core').Length).TrimStart('\')
