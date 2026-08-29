@@ -201,13 +201,24 @@ class DsphRun:
         if res.returncode != 0:
             raise RuntimeError("GenCase failed (%d): %s"
                                % (res.returncode, (res.stdout or "")[-800:]))
+        # Fail fast when GenCase silently produced nothing (rc=0 but no
+        # processed case file at the expected out_base prefix).
+        if not os.path.isfile(out_base + ".xml"):
+            raise RuntimeError("GenCase produced no %s.xml\n%s"
+                               % (out_base, (res.stdout or "")[-800:]))
 
     def start_solver(self, solver_exe, processed_case_xml, out_dir,
                      use_gpu=True):
         os.makedirs(out_dir, exist_ok=True)
         is_cpu = "cpu" in os.path.basename(solver_exe).lower()
         cmd = [solver_exe] + ([] if (is_cpu or not use_gpu) else ["-gpu"])
-        cmd += [processed_case_xml, out_dir]
+        # DSPH resolves the case file by stripping the extension itself:
+        # passing a ".xml" path makes it look for a wrong "<dir>.xml" and
+        # abort with rc=1 (LoadCaseConfig "Case configuration was not found").
+        case_base = processed_case_xml[:-4] \
+            if processed_case_xml.lower().endswith(".xml") \
+            else processed_case_xml
+        cmd += [case_base, out_dir]
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, text=True)
 
@@ -262,15 +273,10 @@ def convert_particles(partvtk_exe, data_dir, out_dir, prefix="PartFluid"):
     return sorted(glob.glob(os.path.join(out_dir, prefix + "_*.vtk")))
 
 
-def read_vtk_points(path):
-    """Parse a legacy ASCII VTK POLYDATA file written by PartVTK.
-
-    Returns (positions (N,3) float32, velocities (N,3) float32 or None).
-    """
+def _vtk_ascii_points(tokens):
+    """Parse legacy ASCII VTK tokens. Returns (positions, velocity)."""
     positions = None
     velocity = None
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        tokens = fh.read().split()
     i, n = 0, len(tokens)
     while i < n:
         tok = tokens[i]
@@ -282,15 +288,69 @@ def read_vtk_points(path):
                 else np.zeros((0, 3))
             i += 3 + count * 3
             continue
-        if tok == "VECTORS" and i + 2 < n and positions is not None:
+        if tok == "VECTORS" and i + 3 < n and positions is not None:
             count = positions.shape[0]
-            vals = np.array(tokens[i + 2:i + 2 + count * 3],
+            # 'VECTORS <name> float' -> values start at i+3
+            vals = np.array(tokens[i + 3:i + 3 + count * 3],
                             dtype=np.float64)
             if vals.size == count * 3:
                 velocity = vals.reshape(-1, 3)
-            i += 2 + count * 3
+            i += 3 + count * 3
             continue
         i += 1
+    return positions, velocity
+
+
+def _vtk_binary_section(data, match, count, dtsize):
+    """Extract `count` 3-vectors following a POINTS/VECTORS header match."""
+    off = match.end()
+    need = count * 3 * dtsize
+    if off + need > len(data):
+        return None
+    endian = ">"  # legacy VTK binary is big-endian per spec
+    vals = np.frombuffer(data, dtype=endian + ("f4" if dtsize == 4 else "f8"),
+                         count=count * 3, offset=off)
+    if not np.isfinite(vals).all() or np.abs(vals).max() > 1e9:
+        # Some writers emit little-endian despite the spec; retry.
+        vals = np.frombuffer(data, dtype="<" + ("f4" if dtsize == 4 else "f8"),
+                             count=count * 3, offset=off)
+        if not np.isfinite(vals).all():
+            return None
+    return vals.reshape(-1, 3).astype(np.float32)
+
+
+def read_vtk_points(path):
+    """Parse a legacy VTK POLYDATA file written by PartVTK (ASCII or binary).
+
+    Returns (positions (N,3) float32, velocities (N,3) float32 or None).
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if b"BINARY" in data[:200]:
+        positions = velocity = None
+        m = re.search(rb"POINTS\s+(\d+)\s+(float|double)\s*\n", data)
+        if m:
+            count, dtsize = int(m.group(1)), (8 if m.group(2) == b"double" else 4)
+            positions = _vtk_binary_section(data, m, count, dtsize)
+        if positions is not None:
+            n = positions.shape[0]
+            m = re.search(rb"VECTORS\s+\S+\s+(float|double)\s*\n", data)
+            if m:
+                dtsize = (8 if m.group(1) == b"double" else 4)
+                velocity = _vtk_binary_section(data, m, n, dtsize)
+            if velocity is None:
+                # PartVTK 5.4 stores velocity as a FIELD array
+                # ("Vel 3 <n> float") instead of a VECTORS section.
+                m = re.search(rb"Vel\s+3\s+\d+\s+(float|double)\s*\n", data)
+                if m:
+                    dtsize = (8 if m.group(1) == b"double" else 4)
+                    velocity = _vtk_binary_section(data, m, n, dtsize)
+        if positions is None:
+            return np.zeros((0, 3), np.float32), None
+        return positions, velocity
+    # ASCII branch
+    tokens = data.decode("utf-8", errors="replace").split()
+    positions, velocity = _vtk_ascii_points(tokens)
     if positions is None:
         return np.zeros((0, 3), np.float32), None
     return (positions.astype(np.float32),

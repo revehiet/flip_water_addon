@@ -72,6 +72,44 @@ def test_write_case_wellformed_xml():
     assert "TimeMax" in text and "TimeOut" in text
 
 
+def test_read_vtk_ascii_sample():
+    d = tempfile.mkdtemp(prefix="dsph_vtk_")
+    p = os.path.join(d, "s.vtk")
+    with open(p, "w", encoding="ascii") as fh:
+        fh.write("# vtk DataFile Version 3.0\ntest\nASCII\n"
+                 "DATASET POLYDATA\nPOINTS 2 float\n0 0 0\n1 2 3\n"
+                 "POINT_DATA 2\nVECTORS Velocity float\n0 0 1\n0.5 0 0\n")
+    pos, vel = read_vtk_points(p)
+    assert pos.shape == (2, 3) and np.allclose(pos[1], (1, 2, 3))
+    assert vel is not None and np.allclose(vel[0], (0, 0, 1))
+
+
+def test_read_vtk_binary_sample():
+    import struct
+    d = tempfile.mkdtemp(prefix="dsph_vtk_")
+    p = os.path.join(d, "b.vtk")
+    pts = struct.pack(">6f", 0.0, 0.0, 0.0, 1.0, 2.0, 3.0)
+    vec = struct.pack(">6f", 0.0, 0.0, 1.0, 0.5, 0.0, 0.0)
+    with open(p, "wb") as fh:
+        fh.write(b"# vtk DataFile Version 3.0\ntest\nBINARY\n"
+                 b"DATASET POLYDATA\nPOINTS 2 float\n" + pts + b"\n"
+                 b"POINT_DATA 2\nVECTORS Velocity float\n" + vec + b"\n")
+    pos, vel = read_vtk_points(p)
+    assert pos.shape == (2, 3) and np.allclose(pos[1], (1, 2, 3))
+    assert vel is not None and np.allclose(vel[1], (0.5, 0, 0))
+    # PartVTK 5.4 form: velocity inside a FIELD array instead of VECTORS.
+    p2 = os.path.join(d, "f.vtk")
+    with open(p2, "wb") as fh:
+        fh.write(b"# vtk DataFile Version 3.0\ntest\nBINARY\n"
+                 b"DATASET POLYDATA\nPOINTS 2 float\n" + pts + b"\n"
+                 b"POINT_DATA 2\nSCALARS Idp unsigned_int\n"
+                 b"LOOKUP_TABLE default\n" + struct.pack(">2I", 7, 8) + b"\n"
+                 b"FIELD FieldData 1\nVel 3 2 float\n" + vec + b"\n")
+    pos, vel = read_vtk_points(p2)
+    assert pos.shape == (2, 3) and np.allclose(pos[1], (1, 2, 3))
+    assert vel is not None and np.allclose(vel[1], (0.5, 0, 0))
+
+
 def test_end_to_end_pipeline():
     t = _tools()
     solver = t["gpu"] or t["cpu"] if t else None
@@ -94,8 +132,9 @@ def test_end_to_end_pipeline():
 
     DsphRun.run_gencase(t["gencase"], defxml, os.path.join(out_dir, "MiniCase"))
 
-    # GenCase writes <base>_Def4.xml next to the binaries it produced.
-    candidates = [p for p in glob.glob(os.path.join(out_dir, "MiniCase", "*.xml"))
+    # GenCase treats out_base as a *file prefix*: it writes MiniCase.xml,
+    # MiniCase.bi4 … directly into out_dir (no MiniCase subdirectory).
+    candidates = [p for p in glob.glob(os.path.join(out_dir, "*.xml"))
                   if os.path.basename(p) != os.path.basename(defxml)]
     assert candidates, "GenCase produced no processed case xml"
     processed = sorted(candidates)[0]
