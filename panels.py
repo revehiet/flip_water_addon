@@ -263,6 +263,12 @@ def _resolve_cache_stage(cache_node):
             return None, None, err
         return 'MPM', domain_obj, ""
 
+    if src.bl_idname == "FLIPWATER_ND_dsph_solver":
+        domain_obj, err = _resolve_dsph_solver_domain(src)
+        if domain_obj is None:
+            return None, None, err
+        return 'DSPH', domain_obj, ""
+
     if src.bl_idname == "FLIPWATER_ND_surface":
         domain_obj, err = _resolve_surface_domain(src)
         if domain_obj is None:
@@ -1705,6 +1711,24 @@ def _resolve_mpm_solver_domain(node):
     return None, "MPM Solver requires a Domain node upstream"
 
 
+def _resolve_dsph_solver_domain(node):
+    """Walk backwards from the DualSPHysics Solver node to find a Domain."""
+    for sock in node.inputs:
+        for link in sock.links:
+            src = link.from_node
+            if src.bl_idname == "FLIPWATER_ND_domain":
+                obj = getattr(src, "domain_object", None)
+                return obj, None
+            # Walk further back through cache/merge nodes
+            for s2 in src.inputs:
+                for l2 in s2.links:
+                    s2src = l2.from_node
+                    if s2src.bl_idname == "FLIPWATER_ND_domain":
+                        obj = getattr(s2src, "domain_object", None)
+                        return obj, None
+    return None, "DualSPHysics Solver requires a Domain node upstream"
+
+
 def _resolve_mpm_solver_from_cache(cache_node):
     """Walk backwards from a Cache node to its upstream MPM Solver,
     following intermediate Cache nodes."""
@@ -1720,6 +1744,86 @@ def _resolve_mpm_solver_from_cache(cache_node):
         if node.bl_idname == "FLIPWATER_ND_cache":
             queue.extend(_linked_nodes_from_input(node, "Data"))
     return None
+
+
+def _resolve_dsph_solver_from_cache(cache_node):
+    """Walk backwards from a Cache node to its upstream DualSPHysics Solver,
+    following intermediate Cache nodes (same traversal as the MPM variant)."""
+    queue = list(_linked_nodes_from_input(cache_node, "Data"))
+    seen = set()
+    while queue:
+        node = queue.pop(0)
+        if node.name in seen:
+            continue
+        seen.add(node.name)
+        if node.bl_idname == "FLIPWATER_ND_dsph_solver":
+            return node
+        if node.bl_idname == "FLIPWATER_ND_cache":
+            queue.extend(_linked_nodes_from_input(node, "Data"))
+    return None
+
+
+class FLIPWATER_ND_dsph_solver(_FLIPWATER_NodeBase, bpy.types.Node):
+    """External DualSPHysics solver (subprocess bridge, LGPL exe runs outside
+    the addon). Box-based cases: the Domain defines the tank, emitters/colliders
+    are consumed as axis-aligned boxes for this first version."""
+    bl_idname = "FLIPWATER_ND_dsph_solver"
+    bl_label = "DualSPHysics Solver"
+    bl_description = ("SPH simulation via the external DualSPHysics engine. "
+                      "Requires the executables path in addon preferences")
+
+    dsph_dp: bpy.props.FloatProperty(
+        name="Particle Spacing dp", default=0.0, min=0.0, soft_min=0.005, soft_max=0.2,
+        precision=4, step=1,
+        description="Initial inter-particle distance (m). 0 = auto "
+                    "(smallest domain dimension / 64). Smaller = more particles")
+    dsph_use_gpu: bpy.props.BoolProperty(
+        name="Use GPU Solver", default=True,
+        description="Run DualSPHysics5.4_win64 (CUDA) instead of the CPU build")
+    dsph_viscosity: bpy.props.FloatProperty(
+        name="Viscosity", default=0.02, min=0.0, max=1.0, step=0.01,
+        description="Artificial viscosity coefficient (DSPH Visco, "
+                    "ViscoTreatment=ARTIFICIAL). Water ~0.02, syrup ~0.1+")
+    dsph_frame_step: bpy.props.IntProperty(
+        name="Bake Every Nth Frame", default=1, min=1, max=10,
+        description="Simulate in multiples of N scene frames to speed up "
+                    "long bakes (cache frames are placed at multiples of N)")
+
+    def init(self, _context):
+        self.inputs.new("FLIPWATER_NodeSocket", "Domain")
+        self.inputs.new("FLIPWATER_NodeSocket", "Colliders")
+        self.outputs.new("FLIPWATER_NodeSocket", "Data")
+        self.width = 220
+
+    @classmethod
+    def poll(cls, ntree):
+        return ntree.bl_idname == TREE_IDNAME
+
+    def draw_buttons(self, _context, layout):
+        _update_node_width_for_mode(self)
+        if node_params_in_npanel():
+            return
+        self._draw_params(_context, layout)
+
+    def _draw_params(self, context, layout):
+        col = layout.column(align=True)
+        col.prop(self, "dsph_dp")
+        col.prop(self, "dsph_use_gpu")
+        col.prop(self, "dsph_viscosity")
+        col.prop(self, "dsph_frame_step")
+
+        layout.separator()
+        props = context.scene.flip_water_dsph
+        row = layout.row(align=True)
+        if props.is_baking:
+            row.operator("flip_water.cancel_bake_dsph", text="Cancel", icon='CANCEL')
+        else:
+            op = row.operator("flip_water.bake_dsph", text="Bake", icon='MOD_FLUIDSIM')
+            op.node_tree_name = self.id_data.name
+            op.node_name = self.name
+        row.operator("flip_water.free_dsph_cache", text="Free", icon='TRASH')
+        if props.is_baking:
+            layout.prop(props, "bake_progress", slider=True)
 
 
 class FLIPWATER_ND_mpm_solver(_FLIPWATER_NodeBase, bpy.types.Node):

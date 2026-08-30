@@ -756,6 +756,12 @@ class FLIPWATER_MpmBakeState(PropertyGroup):
     bake_progress: FloatProperty(default=0.0, min=0.0, max=1.0)
 
 
+class FLIPWATER_DsphBakeState(PropertyGroup):
+    is_baking: BoolProperty(default=False)
+    bake_current_frame: IntProperty(default=0)
+    bake_progress: FloatProperty(default=0.0, min=0.0, max=1.0)
+
+
 class FLIPWATER_WakeBakeState(PropertyGroup):
     is_baking: BoolProperty(default=False)
     bake_current_frame: IntProperty(default=0)
@@ -768,6 +774,7 @@ _CLASSES = (
     FLIPWATER_ObstacleSettings,
     FLIPWATER_SinkSettings,
     FLIPWATER_MpmBakeState,
+    FLIPWATER_DsphBakeState,
     FLIPWATER_WakeBakeState,
 )
 
@@ -787,11 +794,13 @@ def register():
     bpy.types.Object.flip_water_sink = PointerProperty(type=FLIPWATER_SinkSettings)
 
     bpy.types.Scene.flip_water_mpm = PointerProperty(type=FLIPWATER_MpmBakeState)
+    bpy.types.Scene.flip_water_dsph = PointerProperty(type=FLIPWATER_DsphBakeState)
     bpy.types.Scene.flip_water_wake = PointerProperty(type=FLIPWATER_WakeBakeState)
 
 
 def unregister():
     del bpy.types.Scene.flip_water_wake
+    del bpy.types.Scene.flip_water_dsph
     del bpy.types.Scene.flip_water_mpm
     del bpy.types.Object.flip_water_sink
     del bpy.types.Object.flip_water_obstacle

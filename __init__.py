@@ -21,6 +21,7 @@ if "properties" in locals():
     importlib.reload(voxelize)
     importlib.reload(preview_overlay)
     importlib.reload(operators)
+    importlib.reload(operators_dsph)
     importlib.reload(panels)
     importlib.reload(preferences)
     importlib.reload(properties)
@@ -41,6 +42,7 @@ else:
     from . import properties
     from . import preferences
     from . import operators
+    from . import operators_dsph
     from . import panels
     from . import handlers
     from . import nodes_wake
@@ -51,7 +53,8 @@ else:
     from . import wake_deformer
 
 _MODULES = (
-    properties, preferences, preview_overlay, operators, panels, handlers,
+    properties, preferences, preview_overlay, operators, operators_dsph,
+    panels, handlers,
     nodes_wake, evaluator_wake, draw_wake, viewport_ui, wake_deformer,
 )
 

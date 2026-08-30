@@ -51,6 +51,19 @@ class FLIPWATER_AddonPreferences(AddonPreferences):
         update=_tag_node_editors_redraw,
     )
 
+    dsph_root: StringProperty(
+        name="DualSPHysics Root",
+        description=(
+            "Folder containing the DualSPHysics executables (GenCase_win64.exe, "
+            "DualSPHysics5.4_win64.exe or DualSPHysics5.4CPU_win64.exe, "
+            "PartVTK_win64.exe) - either an official package or a local build "
+            "with bin/windows. DualSPHysics is LGPL-licensed and runs as an "
+            "external process; it is never shipped with this addon"
+        ),
+        subtype='DIR_PATH',
+        default="",
+    )
+
     def draw(self, context):
         layout = self.layout
         needed = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -85,6 +98,29 @@ class FLIPWATER_AddonPreferences(AddonPreferences):
         box = layout.box()
         box.label(text="Interface", icon='WINDOW')
         box.prop(self, "node_params_in_npanel")
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="DualSPHysics (SPH solver bridge)", icon='PHYSICS')
+        box.prop(self, "dsph_root")
+        root = self.dsph_root.strip()
+        if not root:
+            box.label(text="Set the path to a DualSPHysics install/build above",
+                      icon='INFO')
+        else:
+            try:
+                from . import dsph_bridge
+                tools = dsph_bridge.find_install(root)
+                labels = (("gencase", "GenCase"), ("gpu", "GPU Solver"),
+                          ("cpu", "CPU Solver"), ("partvtk", "PartVTK"))
+                for key, label in labels:
+                    ok = bool(tools.get(key))
+                    box.label(text=f"{label}: {'found' if ok else 'missing'}",
+                              icon='CHECKMARK' if ok else 'X')
+                if tools.get("gpu") or tools.get("cpu"):
+                    box.label(text="DualSPHysics ready", icon='CHECKMARK')
+            except Exception as e:  # noqa: BLE001 - status probe is best-effort
+                box.label(text=f"Probe failed: {e}", icon='ERROR')
 
         layout.separator()
         col = layout.column(align=True)

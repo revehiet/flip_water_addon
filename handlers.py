@@ -35,6 +35,9 @@ def flip_water_frame_change(scene, depsgraph=None):
     from . import operators
     operators.refresh_seed_previews_for_frame(bpy.context)
     operators.refresh_mpm_cache_previews(frame)
+    from . import operators_dsph
+    operators_dsph.refresh_dsph_cache_previews(frame)
+
 
     from . import wake_deformer
     wake_deformer.update_all(scene)
