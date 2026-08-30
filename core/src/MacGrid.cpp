@@ -69,7 +69,18 @@ void extrapolateField(Array3<float>& f, const Array3<float>& weight, int iterati
     if (i0 > i1 || j0 > j1 || k0 > k1) return; // empty sub-box, nothing to do
 
     int sx = i1 - i0 + 1, sy = j1 - j0 + 1, sz = k1 - k0 + 1;
-    Array3<signed char> valid(sx, sy, sz, 0);
+
+    // Persistent scratch (thread_local: extrapolateAll runs serially inside
+    // one solver, but different solver instances may live on different
+    // threads). Historically this function heap-allocated a fresh validity
+    // grid per call AND a full copy per dilation iteration - the single
+    // largest CPU stage at 64^3 (see core/tests/perf_stage_bench.py).
+    static thread_local Array3<signed char> validBuf, newValidBuf;
+    if (validBuf.nx() != sx || validBuf.ny() != sy || validBuf.nz() != sz) {
+        validBuf.resize(sx, sy, sz, 0);
+        newValidBuf.resize(sx, sy, sz, 0);
+    }
+    Array3<signed char>& valid = validBuf;
     for (int k = k0; k <= k1; ++k)
         for (int j = j0; j <= j1; ++j)
             for (int i = i0; i <= i1; ++i)
@@ -79,8 +90,12 @@ void extrapolateField(Array3<float>& f, const Array3<float>& weight, int iterati
     const int dJ[6] = {0, 0, 1, -1, 0, 0};
     const int dK[6] = {0, 0, 0, 0, 1, -1};
 
+    const size_t boxBytes = size_t(sx) * sy * sz;
     for (int it = 0; it < iterations; ++it) {
-        Array3<signed char> newValid = valid;
+        // newValid starts as a copy of valid - now an allocation-free memcpy
+        // instead of a heap-allocated Array3 copy per iteration.
+        std::memcpy(newValidBuf.data(), validBuf.data(), boxBytes);
+        Array3<signed char>& newValid = newValidBuf;
         bool anyChange = false;
         for (int k = 0; k < sz; ++k) {
             for (int j = 0; j < sy; ++j) {

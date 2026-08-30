@@ -5,6 +5,7 @@
 #include <vector>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 namespace flipcore {
 namespace {
@@ -122,135 +123,417 @@ __global__ void applyJacobi_kernel(
     z[i] = r[i] / diag[i];
 }
 
+// ── persistent GPU scratch ─────────────────────────────────────────────────
+// Historically every substep performed ~10 cudaMalloc/cudaFree pairs plus a
+// full SDF re-upload. cudaMalloc/cudaFree are device-synchronizing driver
+// calls, so this dominated the profile at typical grid sizes. These buffers
+// live for the process lifetime and grow geometrically, so steady-state
+// substeps perform zero allocations; only the data that actually changes
+// (cell types, particle positions, ...) crosses PCIe, over pinned staging
+// memory (direct DMA instead of pageable-buffer staging copies).
+
+inline bool cok(cudaError_t err, const char* tag) {
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "[CUDA] %s: %s\n", tag, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+struct GpuBuf {
+    void* ptr = nullptr;
+    size_t cap = 0;
+    void* acquire(size_t bytes) {
+        if (bytes > cap) {
+            if (ptr) cudaFree(ptr); // ignore errors on grow/teardown paths
+            size_t bigger = bytes + bytes / 2; // 1.5x growth headroom
+            if (cudaMalloc(&ptr, bigger) != cudaSuccess) { ptr = nullptr; cap = 0; return nullptr; }
+            cap = bigger;
+        }
+        return ptr;
+    }
+    ~GpuBuf() { if (ptr) cudaFree(ptr); }
+};
+
+// Pinned host staging buffer for async H2D/D2H copies (pageable memory would
+// force a synchronous staging copy inside the driver).
+struct PinnedBuf {
+    void* ptr = nullptr;
+    size_t cap = 0;
+    void* acquire(size_t bytes) {
+        if (bytes > cap) {
+            if (ptr) cudaFreeHost(ptr);
+            size_t bigger = bytes + bytes / 2;
+            if (cudaHostAlloc(&ptr, bigger, cudaHostAllocDefault) != cudaSuccess) { ptr = nullptr; cap = 0; return nullptr; }
+            cap = bigger;
+        }
+        return ptr;
+    }
+    ~PinnedBuf() { if (ptr) cudaFreeHost(ptr); }
+};
+
+struct GpuScratch {
+    GpuBuf cellType, cellOfIndex, indexOfCell;
+    GpuBuf uF, vF, wF, pressureFull;   // staggered MAC fields + solved pressure (device-resident)
+    GpuBuf b, x, r, p, z, Ap, diag, counter;
+    GpuBuf posX, posY, posZ, velX, velY, velZ, sdf;
+    PinnedBuf up, down;
+    cublasHandle_t cublas = nullptr;
+    bool cublasOk = false;
+    // SDF device-copy provenance: re-upload only when the host field differs
+    // (host data pointer or per-solver revision changed).
+    const void* sdfHostPtr = nullptr;
+    size_t sdfBytes = 0;
+    uint64_t sdfRevision = 0;
+    // Device-resident warm-start pressure (scatterPressure_kernel writes it,
+    // gatherX0_kernel consumes it next substep). Invalidated when the grid is
+    // (re)created at a different resolution or a different solver instance
+    // uses the scratch (scratch is process-global; warm start is per-solver).
+    size_t pressureCells = 0;
+    bool pressureValid = false;
+    const void* owner = nullptr;
+    GpuScratch() { cublasOk = (cublasCreate(&cublas) == CUBLAS_STATUS_SUCCESS); }
+    ~GpuScratch() { if (cublas) cublasDestroy(cublas); }
+};
+
+GpuScratch& scratch() {
+    static GpuScratch s;
+    return s;
+}
+
+/// Marks every FLUID cell (cellType == 1) with a compact index on the GPU:
+/// indexOfCell[cellId] = ci, cellOfIndex[ci] = cellId, counter = total fluid
+/// cells. Replaces the previous per-substep CPU scan over the whole grid.
+__global__ void buildFluidIndex_kernel(
+    const signed char* __restrict__ cellType,
+    int* __restrict__ indexOfCell,
+    int* __restrict__ cellOfIndex,
+    int* __restrict__ counter,
+    int totalCells)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= totalCells) return;
+    if (cellType[c] != CELL_FLUID) return;
+    int ci = atomicAdd(counter, 1);
+    indexOfCell[c] = ci;
+    cellOfIndex[ci] = c;
+}
+
+/// Compact divergence RHS: b[ci] = -rho*h²/dt * div(u,v,w) at the cell center
+/// (same scale/units as the host solver's RHS build).
+__global__ void buildRHS_kernel(
+    const int* __restrict__ cellOfIndex,
+    const float* __restrict__ u, const float* __restrict__ v,
+    const float* __restrict__ w,
+    float* __restrict__ bOut,
+    int nx, int ny, int nz, float scale, float invH, int n)
+{
+    int ci = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ci >= n) return;
+    int cellId = cellOfIndex[ci];
+    int nxNy = nx * ny;
+    int k = cellId / nxNy, rem = cellId % nxNy, j = rem / nx, i = rem % nx;
+    // Staggered Array3 layouts: u(nx+1,ny,nz), v(nx,ny+1,nz), w(nx,ny,nz+1)
+    float du = u[(i + 1) + (nx + 1) * (j + ny * k)] - u[i + (nx + 1) * (j + ny * k)];
+    float dv = v[i + nx * ((j + 1) + (ny + 1) * k)] - v[i + nx * (j + (ny + 1) * k)];
+    float dw = w[i + nx * (j + ny * (k + 1))] - w[i + nx * (j + ny * k)];
+    bOut[ci] = -scale * invH * (du + dv + dw);
+}
+
+/// Warm start: x0[ci] = previous pressure at this step's fluid cell.
+__global__ void gatherX0_kernel(int n, const int* __restrict__ cellOfIndex,
+                                const float* __restrict__ pressureFull,
+                                float* __restrict__ x)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] = pressureFull[cellOfIndex[i]];
+}
+
+/// pressureFull[cellId] = x[ci] — the solved pressure stays on the device as
+/// the next substep's warm start AND as input to the projection below.
+__global__ void scatterPressure_kernel(int n, const int* __restrict__ cellOfIndex,
+                                       const float* __restrict__ x,
+                                       float* __restrict__ pressureFull)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    pressureFull[cellOfIndex[i]] = x[i];
+}
+
+__device__ __forceinline__ bool isPressureCellD(signed char t) {
+    return t == CELL_FLUID || t == CELL_AIR_ACTIVE;
+}
+
+// Face projections, replicating projectPressureVelocities()
+// (PressureSolver.cpp) exactly — including the air-band density scaling —
+// followed by the solid-face zeroing (zeroSolidNormalVelocities parity:
+// the domain edge counts as solid on its missing side).
+
+__global__ void projectU_kernel(
+    const signed char* __restrict__ cellType,
+    const float* __restrict__ pressureFull,
+    float* __restrict__ u,
+    int nx, int ny, int nz,
+    float dtOverH, float invRho, float invRhoAir, float airDensityRatio)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int faces = (nx - 1) * ny * nz;              // interior u-faces, i in [1, nx-1]
+    if (idx >= faces) return;
+    int k = idx / ((nx - 1) * ny);
+    int rem = idx % ((nx - 1) * ny);
+    int j = rem / (nx - 1);
+    int i = rem % (nx - 1) + 1;
+
+    signed char a = cellType[(i - 1) + nx * (j + ny * k)];
+    signed char c = cellType[i + nx * (j + ny * k)];
+    if (a == CELL_SOLID || c == CELL_SOLID) return;
+    bool pa = isPressureCellD(a), pc = isPressureCellD(c);
+    if (!pa && !pc) return;
+    float pA = pa ? pressureFull[(i - 1) + nx * (j + ny * k)] : 0.f;
+    float pB = pc ? pressureFull[i + nx * (j + ny * k)] : 0.f;
+    float rA = (a == CELL_AIR_ACTIVE && airDensityRatio > 0.f) ? invRhoAir : invRho;
+    float rC = (c == CELL_AIR_ACTIVE && airDensityRatio > 0.f) ? invRhoAir : invRho;
+    float inv = (pa && pc) ? 0.5f * (rA + rC) : (rA + rC - invRho);
+    u[i + (nx + 1) * (j + ny * k)] -= dtOverH * inv * (pB - pA);
+}
+
+__global__ void projectV_kernel(
+    const signed char* __restrict__ cellType,
+    const float* __restrict__ pressureFull,
+    float* __restrict__ v,
+    int nx, int ny, int nz,
+    float dtOverH, float invRho, float invRhoAir, float airDensityRatio)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int faces = nx * (ny - 1) * nz;              // interior v-faces, j in [1, ny-1]
+    if (idx >= faces) return;
+    int k = idx / (nx * (ny - 1));
+    int rem = idx % (nx * (ny - 1));
+    int j = rem / nx + 1;
+    int i = rem % nx;
+
+    signed char a = cellType[i + nx * ((j - 1) + ny * k)];
+    signed char c = cellType[i + nx * (j + ny * k)];
+    if (a == CELL_SOLID || c == CELL_SOLID) return;
+    bool pa = isPressureCellD(a), pc = isPressureCellD(c);
+    if (!pa && !pc) return;
+    float pA = pa ? pressureFull[i + nx * ((j - 1) + ny * k)] : 0.f;
+    float pB = pc ? pressureFull[i + nx * (j + ny * k)] : 0.f;
+    float rA = (a == CELL_AIR_ACTIVE && airDensityRatio > 0.f) ? invRhoAir : invRho;
+    float rC = (c == CELL_AIR_ACTIVE && airDensityRatio > 0.f) ? invRhoAir : invRho;
+    float inv = (pa && pc) ? 0.5f * (rA + rC) : (rA + rC - invRho);
+    v[i + nx * (j + (ny + 1) * k)] -= dtOverH * inv * (pB - pA);
+}
+
+__global__ void projectW_kernel(
+    const signed char* __restrict__ cellType,
+    const float* __restrict__ pressureFull,
+    float* __restrict__ w,
+    int nx, int ny, int nz,
+    float dtOverH, float invRho, float invRhoAir, float airDensityRatio)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int faces = nx * ny * (nz - 1);              // interior w-faces, k in [1, nz-1]
+    if (idx >= faces) return;
+    int k = idx / (nx * ny) + 1;
+    int rem = idx % (nx * ny);
+    int j = rem / nx;
+    int i = rem % nx;
+
+    signed char a = cellType[i + nx * (j + ny * (k - 1))];
+    signed char c = cellType[i + nx * (j + ny * k)];
+    if (a == CELL_SOLID || c == CELL_SOLID) return;
+    bool pa = isPressureCellD(a), pc = isPressureCellD(c);
+    if (!pa && !pc) return;
+    float pA = pa ? pressureFull[i + nx * (j + ny * (k - 1))] : 0.f;
+    float pB = pc ? pressureFull[i + nx * (j + ny * k)] : 0.f;
+    float rA = (a == CELL_AIR_ACTIVE && airDensityRatio > 0.f) ? invRhoAir : invRho;
+    float rC = (c == CELL_AIR_ACTIVE && airDensityRatio > 0.f) ? invRhoAir : invRho;
+    float inv = (pa && pc) ? 0.5f * (rA + rC) : (rA + rC - invRho);
+    w[i + nx * (j + ny * k)] -= dtOverH * inv * (pB - pA);
+}
+
+__global__ void zeroSolidU_kernel(const signed char* __restrict__ cellType,
+                                  float* __restrict__ u, int nx, int ny, int nz)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int faces = (nx + 1) * ny * nz;
+    if (idx >= faces) return;
+    int k = idx / ((nx + 1) * ny);
+    int rem = idx % ((nx + 1) * ny);
+    int j = rem / (nx + 1);
+    int i = rem % (nx + 1);
+    bool sl = (i > 0) ? (cellType[(i - 1) + nx * (j + ny * k)] == CELL_SOLID) : true;
+    bool sr = (i < nx) ? (cellType[i + nx * (j + ny * k)] == CELL_SOLID) : true;
+    if (sl || sr) u[idx] = 0.f;
+}
+
+__global__ void zeroSolidV_kernel(const signed char* __restrict__ cellType,
+                                  float* __restrict__ v, int nx, int ny, int nz)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int faces = nx * (ny + 1) * nz;
+    if (idx >= faces) return;
+    int k = idx / (nx * (ny + 1));
+    int rem = idx % (nx * (ny + 1));
+    int j = rem / nx;
+    int i = rem % nx;
+    bool sb = (j > 0) ? (cellType[i + nx * ((j - 1) + ny * k)] == CELL_SOLID) : true;
+    bool sa = (j < ny) ? (cellType[i + nx * (j + ny * k)] == CELL_SOLID) : true;
+    if (sb || sa) v[idx] = 0.f;
+}
+
+__global__ void zeroSolidW_kernel(const signed char* __restrict__ cellType,
+                                  float* __restrict__ w, int nx, int ny, int nz)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int faces = nx * ny * (nz + 1);
+    if (idx >= faces) return;
+    int k = idx / (nx * ny);
+    int rem = idx % (nx * ny);
+    int j = rem / nx;
+    int i = rem % nx;
+    bool sbk = (k > 0) ? (cellType[i + nx * (j + ny * (k - 1))] == CELL_SOLID) : true;
+    bool sf = (k < nz) ? (cellType[i + nx * (j + ny * k)] == CELL_SOLID) : true;
+    if (sbk || sf) w[idx] = 0.f;
+}
+
 } // anonymous namespace
 
 // ── public entry point ─────────────────────────────────────────────────────
+//
+// Tier-A rewrite: persistent scratch buffers (zero per-substep cudaMalloc),
+// GPU-built fluid index, pinned-memory transfers, and the velocity projection
+// + solid-face zeroing fused into the same device pass so the pressure field
+// never round-trips through the host. On success the MAC grid fields
+// (u, v, w) come back projected and solid-zeroed; on ANY failure the host
+// state is untouched and -1 is returned so the caller falls back to the CPU
+// solver. Warm start = device-resident previous pressure (useWarmStart).
 
 extern "C" int solvePressureCUDA(void* pg, float dt, float rho,
                                  int maxIterations, float tolerance,
-                                 const float* x0Host)
+                                 int useWarmStart, float airDensityRatio)
 {
     flipcore::MacGrid& grid = *static_cast<flipcore::MacGrid*>(pg);
-    // ── build fluid index (CPU) ────────────────────────────────────────
-    int nx = grid.nx(), ny = grid.ny(), nz = grid.nz();
-    int nxNy = nx * ny;
-    size_t totalCells = size_t(nx) * ny * nz;
+    GpuScratch& S = scratch();
+    if (!S.cublasOk) return -1;
 
-    std::vector<int> cellOfIndex;
-    std::vector<int> indexOfCell(totalCells, -1);
-    for (int k = 0; k < nz; ++k)
-        for (int j = 0; j < ny; ++j)
-            for (int i = 0; i < nx; ++i) {
-                if (grid.cellType(i, j, k) != CELL_FLUID) continue;
-                size_t cellId = size_t(i) + size_t(nx) * (size_t(j) + size_t(ny) * size_t(k));
-                indexOfCell[cellId] = int(cellOfIndex.size());
-                cellOfIndex.push_back(int(cellId));
-            }
+    const int nx = grid.nx(), ny = grid.ny(), nz = grid.nz();
+    const size_t totalCells = size_t(nx) * ny * nz;
+    if (totalCells == 0) return 0;
+    const size_t nu = size_t(nx + 1) * ny * nz;
+    const size_t nv = size_t(nx) * (ny + 1) * nz;
+    const size_t nw = size_t(nx) * ny * (nz + 1);
+    const int block = 256;
+    auto gd = [block](size_t count) { return dim3(unsigned((count + block - 1) / block)); };
 
-    size_t n = cellOfIndex.size();
+    // Warm-start provenance: scratch is process-global, so the resident
+    // pressure is only valid for the same solver instance and grid size.
+    if (S.owner != pg || S.pressureCells != totalCells) {
+        S.owner = pg;
+        S.pressureCells = totalCells;
+        S.pressureValid = false;
+    }
+
+    // ── upload everything the device needs (pinned staging) ────────────
+    void* up = S.up.acquire(totalCells + (nu + nv + nw) * sizeof(float));
+    signed char* d_cellType = static_cast<signed char*>(S.cellType.acquire(totalCells));
+    float* d_uF = static_cast<float*>(S.uF.acquire(nu * sizeof(float)));
+    float* d_vF = static_cast<float*>(S.vF.acquire(nv * sizeof(float)));
+    float* d_wF = static_cast<float*>(S.wF.acquire(nw * sizeof(float)));
+    float* d_pressureFull = static_cast<float*>(S.pressureFull.acquire(totalCells * sizeof(float)));
+    int* d_counter = static_cast<int*>(S.counter.acquire(sizeof(int)));
+    int* d_indexOfCell = static_cast<int*>(S.indexOfCell.acquire(totalCells * sizeof(int)));
+    int* d_cellOfIndex = static_cast<int*>(S.cellOfIndex.acquire(totalCells * sizeof(int)));
+    if (!up || !d_cellType || !d_uF || !d_vF || !d_wF || !d_pressureFull ||
+        !d_counter || !d_indexOfCell || !d_cellOfIndex)
+        return -1;
+
+    signed char* hCell = static_cast<signed char*>(up);
+    float* hU = reinterpret_cast<float*>(hCell + totalCells);
+    float* hV = hU + nu;
+    float* hW = hV + nv;
+    std::memcpy(hCell, grid.cellType.data(), totalCells);
+    std::memcpy(hU, grid.u.data(), nu * sizeof(float));
+    std::memcpy(hV, grid.v.data(), nv * sizeof(float));
+    std::memcpy(hW, grid.w.data(), nw * sizeof(float));
+    if (!cok(cudaMemcpyAsync(d_cellType, hCell, totalCells, cudaMemcpyHostToDevice), "up cellType")) return -1;
+    if (!cok(cudaMemcpyAsync(d_uF, hU, nu * sizeof(float), cudaMemcpyHostToDevice), "up u")) return -1;
+    if (!cok(cudaMemcpyAsync(d_vF, hV, nv * sizeof(float), cudaMemcpyHostToDevice), "up v")) return -1;
+    if (!cok(cudaMemcpyAsync(d_wF, hW, nw * sizeof(float), cudaMemcpyHostToDevice), "up w")) return -1;
+
+    // ── fluid index built on the GPU (replaces the host's full-grid scan) ─
+    if (!cok(cudaMemsetAsync(d_counter, 0, sizeof(int)), "zero counter")) return -1;
+    buildFluidIndex_kernel<<<gd(totalCells), block>>>(
+        d_cellType, d_indexOfCell, d_cellOfIndex, d_counter, int(totalCells));
+    if (!cok(cudaGetLastError(), "buildFluidIndex")) return -1;
+
+    int n = 0;
+    if (!cok(cudaMemcpy(&n, d_counter, sizeof(int), cudaMemcpyDeviceToHost), "read counter")) return -1;
+    if (n <= 0) return 0; // no fluid cells: nothing to solve, host state untouched
+    const size_t nc = size_t(n);
+
+    float* d_b    = static_cast<float*>(S.b.acquire(nc * sizeof(float)));
+    float* d_x    = static_cast<float*>(S.x.acquire(nc * sizeof(float)));
+    float* d_r    = static_cast<float*>(S.r.acquire(nc * sizeof(float)));
+    float* d_p    = static_cast<float*>(S.p.acquire(nc * sizeof(float)));
+    float* d_z    = static_cast<float*>(S.z.acquire(nc * sizeof(float)));
+    float* d_Ap   = static_cast<float*>(S.Ap.acquire(nc * sizeof(float)));
+    float* d_diag = static_cast<float*>(S.diag.acquire(nc * sizeof(float)));
+    cublasHandle_t cublas = S.cublas;
+    if (!d_b || !d_x || !d_r || !d_p || !d_z || !d_Ap || !d_diag) return -1;
+
+    const float h = grid.h();
+    const float scale = rho * h * h / std::max(dt, 1e-6f);
+    const float dtOverH = dt / h;
+    const float invRho = 1.f / std::max(rho, 1e-6f);
+    const float invRhoAir = (airDensityRatio > 0.f) ? 1.f / (rho * airDensityRatio) : invRho;
+
+    buildRHS_kernel<<<gd(nc), block>>>(d_cellOfIndex, d_uF, d_vF, d_wF, d_b,
+                                       nx, ny, nz, scale, 1.f / h, n);
+    if (!cok(cudaGetLastError(), "buildRHS")) return -1;
+    computeDiagonal_kernel<<<gd(nc), block>>>(d_cellOfIndex, d_cellType, d_diag, nx, ny, nz, n);
+    if (!cok(cudaGetLastError(), "computeDiagonal")) return -1;
     int iter = 0;
-    if (n == 0) return 0;
-
-    // ── build RHS on CPU ───────────────────────────────────────────────
-    float scale = rho * grid.h() * grid.h() / std::max(dt, 1e-6f);
-    auto div = [&](int i, int j, int k) -> float {
-        float du = grid.u(i + 1, j, k) - grid.u(i, j, k);
-        float dv = grid.v(i, j + 1, k) - grid.v(i, j, k);
-        float dw = grid.w(i, j, k + 1) - grid.w(i, j, k);
-        return (du + dv + dw) / grid.h();
-    };
-    std::vector<float> b_host(n);
-    for (size_t ci = 0; ci < n; ++ci) {
-        int cellId = cellOfIndex[ci];
-        int k = cellId / nxNy, rem = cellId % nxNy, j = rem / nx, i = rem % nx;
-        b_host[ci] = -scale * div(i, j, k);
-    }
-
-    // ── GPU allocations ────────────────────────────────────────────────
-    cudaError_t err;
-    int *d_cellOfIndex = nullptr, *d_indexOfCell = nullptr;
-    signed char *d_cellType = nullptr;
-    float *d_b = nullptr, *d_x = nullptr, *d_r = nullptr, *d_p = nullptr,
-          *d_z = nullptr, *d_Ap = nullptr, *d_diag = nullptr;
-
-    auto gpuAlloc = [&](auto*& ptr, size_t bytes) -> bool {
-        err = cudaMalloc(&ptr, bytes);
-        if (err != cudaSuccess) { checkCuda(err, "cudaMalloc"); return false; }
-        return true;
-    };
-    #define ALLOC_OR_FAIL(ptr, bytes) if (!gpuAlloc(ptr, bytes)) goto cleanup
-
-    ALLOC_OR_FAIL(d_cellOfIndex, n * sizeof(int));
-    ALLOC_OR_FAIL(d_indexOfCell, totalCells * sizeof(int));
-    ALLOC_OR_FAIL(d_cellType,    totalCells * sizeof(signed char));
-    ALLOC_OR_FAIL(d_b,           n * sizeof(float));
-    ALLOC_OR_FAIL(d_x,           n * sizeof(float));
-    ALLOC_OR_FAIL(d_r,           n * sizeof(float));
-    ALLOC_OR_FAIL(d_p,           n * sizeof(float));
-    ALLOC_OR_FAIL(d_z,           n * sizeof(float));
-    ALLOC_OR_FAIL(d_Ap,          n * sizeof(float));
-    ALLOC_OR_FAIL(d_diag,        n * sizeof(float));
-
-    // x0 = 0 must hold for the CG recurrence (r0 = b), so zero d_x explicitly.
-    cudaMemset(d_x, 0, n * sizeof(float));
-
-    // ── upload to GPU ──────────────────────────────────────────────────
-    cudaMemcpy(d_cellOfIndex, cellOfIndex.data(), n * sizeof(int),              cudaMemcpyHostToDevice);
-    cudaMemcpy(d_indexOfCell, indexOfCell.data(), totalCells * sizeof(int),    cudaMemcpyHostToDevice);
-    // cellType is stored as Array3<signed char> with contiguous .data()
-    cudaMemcpy(d_cellType,    grid.cellType.data(), totalCells * sizeof(signed char), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b,           b_host.data(),        n * sizeof(float),              cudaMemcpyHostToDevice);
-
-    // ── cuBLAS handle ──────────────────────────────────────────────────
-    cublasHandle_t cublas = nullptr;
-    if (cublasCreate(&cublas) != CUBLAS_STATUS_SUCCESS) {
-        err = cudaErrorUnknown; // signal CPU fallback to the caller
-        goto cleanup;
-    }
-
-    // ── precompute diagonal ─────────────────────────────────────────────
-    {
-        int block = 256, gridDimC = int((n + block - 1) / block);
-        computeDiagonal_kernel<<<gridDimC, block>>>(d_cellOfIndex, d_cellType, d_diag, nx, ny, nz, int(n));
-        cudaDeviceSynchronize();
-    }
 
     // ── CG loop ────────────────────────────────────────────────────────
     {
         int block = 256, gridDimC = int((n + block - 1) / block);
         float one = 1.f;
 
-        // Initial guess: previous pressure snapshot (warm start) or zero.
-        if (x0Host != nullptr) {
-            std::vector<float> x0(n, 0.f);
-            for (size_t ci = 0; ci < n; ++ci) x0[ci] = x0Host[size_t(cellOfIndex[ci])];
-            cudaMemcpy(d_x, x0.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+        // Initial guess: device-resident previous pressure (warm start) or
+        // zero. The snapshot round-trip through the host is gone entirely.
+        if (useWarmStart && S.pressureValid) {
+            gatherX0_kernel<<<gridDimC, block>>>(n, d_cellOfIndex, d_pressureFull, d_x);
+            cudaDeviceSynchronize();
             // r0 = b - A*x0
             applyA_kernel<<<gridDimC, block>>>(d_cellOfIndex, d_indexOfCell, d_cellType,
-                                                d_x, d_Ap, nx, ny, nz, int(n));
+                                                d_x, d_Ap, nx, ny, nz, n);
             cudaDeviceSynchronize();
-            cublasScopy(cublas, int(n), d_b, 1, d_r, 1);
+            cublasScopy(cublas, n, d_b, 1, d_r, 1);
             float mone = -1.f;
-            cublasSaxpy(cublas, int(n), &mone, d_Ap, 1, d_r, 1);
+            cublasSaxpy(cublas, n, &mone, d_Ap, 1, d_r, 1);
         } else {
             // x0 = 0, r0 = b
-            cublasScopy(cublas, int(n), d_b, 1, d_r, 1);
+            cudaMemset(d_x, 0, n * sizeof(float));
+            cublasScopy(cublas, n, d_b, 1, d_r, 1);
         }
 
         // z0 = M^-1 * r0
-        applyJacobi_kernel<<<gridDimC, block>>>(d_diag, d_r, d_z, int(n));
+        applyJacobi_kernel<<<gridDimC, block>>>(d_diag, d_r, d_z, n);
         cudaDeviceSynchronize();
 
         // p0 = z0
-        cublasScopy(cublas, int(n), d_z, 1, d_p, 1);
+        cublasScopy(cublas, n, d_z, 1, d_p, 1);
 
         float rzOld = 0.f, rzNew = 0.f;
-        cublasSdot(cublas, int(n), d_r, 1, d_z, 1, &rzOld);
+        cublasSdot(cublas, n, d_r, 1, d_z, 1, &rzOld);
 
         float rsInit = 0.f, rsNew = 0.f;
-        cublasSdot(cublas, int(n), d_r, 1, d_r, 1, &rsInit);
+        cublasSdot(cublas, n, d_r, 1, d_r, 1, &rsInit);
 
-        if (std::sqrt(std::max(rsInit, 0.f)) < 1e-9f) { iter = 0; goto cleanup_cublas; }
+        if (std::sqrt(std::max(rsInit, 0.f)) >= 1e-9f) {
 
         for (; iter < maxIterations; ++iter) {
             // Ap = A * p
@@ -288,33 +571,41 @@ extern "C" int solvePressureCUDA(void* pg, float dt, float rho,
 
             rzOld = rzNew;
         }
+        } // rsInit guard
     }
 
-cleanup_cublas:
-    cublasDestroy(cublas);
+    // ── device-side finish: scatter pressure, project velocities, zero
+    // solid faces. Pressure never touches the host on this path; it stays
+    // resident as the next substep's warm start.
+    scatterPressure_kernel<<<gd(nc), block>>>(n, d_cellOfIndex, d_x, d_pressureFull);
+    if (!cok(cudaGetLastError(), "scatterPressure")) return -1;
+    S.pressureValid = true;
 
-    // ── download pressure back to CPU ──────────────────────────────────
-    {
-        std::vector<float> x_host(n, 0.f);
-        cudaMemcpy(x_host.data(), d_x, n * sizeof(float), cudaMemcpyDeviceToHost);
-        for (size_t ci = 0; ci < n; ++ci) {
-            int cellId = cellOfIndex[ci];
-            int k = cellId / nxNy, rem = cellId % nxNy, j = rem / nx, i = rem % nx;
-            grid.pressure(i, j, k) = x_host[ci];
-        }
-    }
+    const float airRatio = airDensityRatio;
+    projectU_kernel<<<gd(size_t(std::max(nx - 1, 0)) * ny * nz), block>>>(
+        d_cellType, d_pressureFull, d_uF, nx, ny, nz, dtOverH, invRho, invRhoAir, airRatio);
+    projectV_kernel<<<gd(size_t(nx) * std::max(ny - 1, 0) * nz), block>>>(
+        d_cellType, d_pressureFull, d_vF, nx, ny, nz, dtOverH, invRho, invRhoAir, airRatio);
+    projectW_kernel<<<gd(size_t(nx) * ny * std::max(nz - 1, 0)), block>>>(
+        d_cellType, d_pressureFull, d_wF, nx, ny, nz, dtOverH, invRho, invRhoAir, airRatio);
+    zeroSolidU_kernel<<<gd(nu), block>>>(d_cellType, d_uF, nx, ny, nz);
+    zeroSolidV_kernel<<<gd(nv), block>>>(d_cellType, d_vF, nx, ny, nz);
+    zeroSolidW_kernel<<<gd(nw), block>>>(d_cellType, d_wF, nx, ny, nz);
+    if (!cok(cudaGetLastError(), "project/zero")) return -1;
 
-cleanup:
-    cudaFree(d_cellOfIndex); cudaFree(d_indexOfCell); cudaFree(d_cellType);
-    cudaFree(d_b); cudaFree(d_x); cudaFree(d_r); cudaFree(d_p);
-    cudaFree(d_z); cudaFree(d_Ap); cudaFree(d_diag);
+    // ── download the projected staggered fields (pinned staging) ───────
+    void* down = S.down.acquire((nu + nv + nw) * sizeof(float));
+    if (!down) return -1;
+    if (!cok(cudaMemcpyAsync(down, d_uF, nu * sizeof(float), cudaMemcpyDeviceToHost), "down u")) return -1;
+    if (!cok(cudaMemcpyAsync(static_cast<char*>(down) + nu * sizeof(float),
+                             d_vF, nv * sizeof(float), cudaMemcpyDeviceToHost), "down v")) return -1;
+    if (!cok(cudaMemcpyAsync(static_cast<char*>(down) + (nu + nv) * sizeof(float),
+                             d_wF, nw * sizeof(float), cudaMemcpyDeviceToHost), "down w")) return -1;
+    if (!cok(cudaDeviceSynchronize(), "download sync")) return -1;
 
-    #undef ALLOC_OR_FAIL
-
-    if (err != cudaSuccess) {
-        // If any cudaMalloc failed, the CG didn't run - signal fallback
-        return -1;
-    }
+    std::memcpy(grid.u.data(), down, nu * sizeof(float));
+    std::memcpy(grid.v.data(), static_cast<const char*>(down) + nu * sizeof(float), nv * sizeof(float));
+    std::memcpy(grid.w.data(), static_cast<const char*>(down) + (nu + nv) * sizeof(float), nw * sizeof(float));
 
     return iter;
 }
@@ -421,33 +712,47 @@ extern "C" int resolveObstacleCollisionsCUDA(void* psolver) {
     flipcore::Vec3 dmin = s.domainMin(), dmax = s.domainMax();
     size_t sdfBytes = size_t(nx) * ny * nz * sizeof(float);
 
-    // Host-side buffers (declared before any goto for MSVC compliance)
+    GpuScratch& S = scratch();
+    // Persistent device buffers + pinned staging: zero cudaMalloc/cudaFree on
+    // the steady-state path (this used to be 7 mallocs + frees per substep).
+    float* d_posX = static_cast<float*>(S.posX.acquire(n * sizeof(float)));
+    float* d_posY = static_cast<float*>(S.posY.acquire(n * sizeof(float)));
+    float* d_posZ = static_cast<float*>(S.posZ.acquire(n * sizeof(float)));
+    float* d_velX = static_cast<float*>(S.velX.acquire(n * sizeof(float)));
+    float* d_velY = static_cast<float*>(S.velY.acquire(n * sizeof(float)));
+    float* d_velZ = static_cast<float*>(S.velZ.acquire(n * sizeof(float)));
+    float* d_sdf  = static_cast<float*>(S.sdf.acquire(sdfBytes));
+    void* up = S.up.acquire(6 * n * sizeof(float) + sdfBytes);
+    void* down = S.down.acquire(6 * n * sizeof(float));
+    if (!d_posX || !d_posY || !d_posZ || !d_velX || !d_velY || !d_velZ ||
+        !d_sdf || !up || !down)
+        return -1;
+
+    // ── upload positions/velocities/SDF (single pinned window, async) ────
+    float* hPos = static_cast<float*>(up);
+    float* hVel = hPos + 3 * n;
     const auto& pos = s.positions();
     const auto& vel = s.velocities();
-    std::vector<float> px(n), py(n), pz(n), vx(n), vy(n), vz(n);
     for (size_t i = 0; i < n; ++i) {
-        px[i]=pos[i].x; py[i]=pos[i].y; pz[i]=pos[i].z;
-        vx[i]=vel[i].x; vy[i]=vel[i].y; vz[i]=vel[i].z;
+        hPos[3 * i + 0] = pos[i].x; hPos[3 * i + 1] = pos[i].y; hPos[3 * i + 2] = pos[i].z;
+        hVel[3 * i + 0] = vel[i].x; hVel[3 * i + 1] = vel[i].y; hVel[3 * i + 2] = vel[i].z;
     }
+    float* hSdf = hVel + 3 * n;
+    std::memcpy(hSdf, sdf.data(), sdfBytes);
 
-    // Alloc GPU
-    float *d_posX=nullptr, *d_posY=nullptr, *d_posZ=nullptr;
-    float *d_velX=nullptr, *d_velY=nullptr, *d_velZ=nullptr, *d_sdf=nullptr;
-    cudaError_t err = cudaSuccess;
-    #define CUALLOC(p, sz) if (cudaMalloc(&p, sz) != cudaSuccess) goto col_cleanup
-    CUALLOC(d_posX, n * sizeof(float)); CUALLOC(d_posY, n * sizeof(float));
-    CUALLOC(d_posZ, n * sizeof(float)); CUALLOC(d_velX, n * sizeof(float));
-    CUALLOC(d_velY, n * sizeof(float)); CUALLOC(d_velZ, n * sizeof(float));
-    CUALLOC(d_sdf, sdfBytes);
-
-    // Upload: positions, velocities, SDF grid
-    cudaMemcpy(d_posX, px.data(), n*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_posY, py.data(), n*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_posZ, pz.data(), n*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_velX, vx.data(), n*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_velY, vy.data(), n*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_velZ, vz.data(), n*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sdf, sdf.data(), sdfBytes, cudaMemcpyHostToDevice);
+    // The SDF field only changes when setObstacleSDF() is called again
+    // (revision bump) or a different host field arrives; skip its PCIe
+    // transfer otherwise — this was the whole-SDF re-upload per substep.
+    bool sdfDirty = (S.sdfHostPtr != sdf.data()) || (S.sdfBytes != sdfBytes) ||
+                    (S.sdfRevision != s.obstacleSdfRevision());
+    if (!cok(cudaMemcpyAsync(d_posX, hPos, 3 * n * sizeof(float), cudaMemcpyHostToDevice), "col up pos")) return -1;
+    if (!cok(cudaMemcpyAsync(d_velX, hVel, 3 * n * sizeof(float), cudaMemcpyHostToDevice), "col up vel")) return -1;
+    if (sdfDirty) {
+        if (!cok(cudaMemcpyAsync(d_sdf, hSdf, sdfBytes, cudaMemcpyHostToDevice), "col up sdf")) return -1;
+        S.sdfHostPtr = sdf.data();
+        S.sdfBytes = sdfBytes;
+        S.sdfRevision = s.obstacleSdfRevision();
+    }
 
     int block = 256, gridDim = int((n + block - 1) / block);
     sdfCollisionKernel<<<gridDim, block>>>(
@@ -455,28 +760,22 @@ extern "C" int resolveObstacleCollisionsCUDA(void* psolver) {
         d_sdf, nx, ny, nz,
         dmin.x, dmin.y, dmin.z, dmax.x, dmax.y, dmax.z,
         h, margin, int(n));
-    cudaDeviceSynchronize();
+    if (!cok(cudaGetLastError(), "sdfCollisionKernel")) return -1;
 
-    // Download results
-    cudaMemcpy(px.data(), d_posX, n*sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(py.data(), d_posY, n*sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(pz.data(), d_posZ, n*sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(vx.data(), d_velX, n*sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(vy.data(), d_velY, n*sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(vz.data(), d_velZ, n*sizeof(float), cudaMemcpyDeviceToHost);
+    // ── download updated positions/velocities ───────────────────────────
+    if (!cok(cudaMemcpyAsync(down, d_posX, 3 * n * sizeof(float), cudaMemcpyDeviceToHost), "col down pos")) return -1;
+    if (!cok(cudaMemcpyAsync(static_cast<char*>(down) + 3 * n * sizeof(float),
+                             d_velX, 3 * n * sizeof(float), cudaMemcpyDeviceToHost), "col down vel")) return -1;
+    if (!cok(cudaDeviceSynchronize(), "col sync")) return -1;
 
+    const float* hPosOut = static_cast<const float*>(down);
+    const float* hVelOut = hPosOut + 3 * n;
     for (size_t i = 0; i < n; ++i) {
-        s.positions()[i] = flipcore::Vec3(px[i], py[i], pz[i]);
-        s.velocities()[i] = flipcore::Vec3(vx[i], vy[i], vz[i]);
+        s.positions()[i] = flipcore::Vec3(hPosOut[3 * i + 0], hPosOut[3 * i + 1], hPosOut[3 * i + 2]);
+        s.velocities()[i] = flipcore::Vec3(hVelOut[3 * i + 0], hVelOut[3 * i + 1], hVelOut[3 * i + 2]);
     }
 
-col_cleanup:
-    cudaFree(d_posX); cudaFree(d_posY); cudaFree(d_posZ);
-    cudaFree(d_velX); cudaFree(d_velY); cudaFree(d_velZ);
-    cudaFree(d_sdf);
-    #undef CUALLOC
-
-    return (err == cudaSuccess) ? int(n) : -1;
+    return int(n);
 }
 
 } // namespace flipcore

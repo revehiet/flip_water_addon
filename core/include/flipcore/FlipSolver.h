@@ -3,6 +3,7 @@
 #include "Vec3.h"
 #include <vector>
 #include <cstdint>
+#include <chrono>
 
 namespace flipcore {
 
@@ -149,10 +150,53 @@ public:
 
     // SDF obstacle data access for GPU collision
     bool hasObstacleSDF() const { return hasObstacleSDF_; }
+    // Monotonic counter bumped by setObstacleSDF(); lets the GPU collision
+    // path detect "SDF unchanged since last upload" without comparing data.
+    uint64_t obstacleSdfRevision() const { return obstacleSdfRevision_; }
     const Array3<float>& obstacleSDF() const { return obstacleSDF_; }
 
     // GPU collision dispatch (called from CUDA code)
     void resolveObstacleCollisions();
+
+    // ── Per-stage performance counters ────────────────────────────────────
+    // Accumulated wall-clock time per solver stage across all substeps since
+    // the last resetStageTimings(). Exposed to Python via stage_timings() so
+    // optimization work (GPU path, persistent buffers, ...) can be judged by
+    // measurement rather than intuition. Times are milliseconds.
+    enum Stage : int {
+        SG_P2G = 0,      // velocity/phase-field particle->grid deposition
+        SG_CLASSIFY,     // fluid/air/solid classification (+ air band marking)
+        SG_EXTRAP,       // velocity extrapolation (both pre- and post-solve)
+        SG_GRAVITY,      // gravity + solid-normal velocity zeroing
+        SG_PRESSURE,     // the CG solve incl. all GPU uploads/downloads
+        SG_PROJECT,      // CUDA-path velocity projection (CPU solver folds
+                         // its projection into SG_PRESSURE)
+        SG_G2P,          // FLIP/PIC velocity blend
+        SG_ADVECT,       // temporal jitter + locally sub-stepped advection
+        SG_COLLIDE,      // obstacle SDF/mask collision push-out
+        SG_POST,         // viscosity / surface tension / vorticity / reseed
+        SG_COUNT
+    };
+    struct StageTiming {
+        double ms = 0.0;
+        uint64_t calls = 0;
+    };
+    struct ScopedStage {
+        FlipSolver* s;
+        int stage;
+        std::chrono::steady_clock::time_point t0;
+        ScopedStage(FlipSolver& solver, int st)
+            : s(&solver), stage(st), t0(std::chrono::steady_clock::now()) {}
+        ~ScopedStage() {
+            auto& t = s->stageTimings_[size_t(stage)];
+            t.ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+            ++t.calls;
+        }
+    };
+    void resetStageTimings() { for (auto& t : stageTimings_) { t.ms = 0.0; t.calls = 0; } }
+    const StageTiming& stageTiming(int stage) const { return stageTimings_[size_t(stage)]; }
+    int lastPressureIterations() const { return lastPressureIters_; }
 
 private:
     void substep(float dtGrid);
@@ -192,6 +236,14 @@ private:
 
     Array3<float> pressureGuess_;  // warm-start pressure snapshot (grid-sized)
     int adaptiveMaxIters_ = 0;     // current adaptive CG iteration cap (0 = uninitialized)
+
+    // Perf counters (SG_* stages) + last CG iteration count, for benchmarking
+    std::vector<StageTiming> stageTimings_ = std::vector<StageTiming>(size_t(SG_COUNT));
+    int lastPressureIters_ = 0;
+
+    // Bumped on every setObstacleSDF() so the GPU collision path can cache
+    // its device-side SDF copy and skip re-uploads of an unchanged field.
+    uint64_t obstacleSdfRevision_ = 0;
 };
 
 } // namespace flipcore

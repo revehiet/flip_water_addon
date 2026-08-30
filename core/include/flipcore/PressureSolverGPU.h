@@ -8,11 +8,12 @@ extern "C" {
 
 // Pointer to avoid C++ references in extern "C" interface.
 // Caller passes &grid from C++ code; CUDA implementation dereferences.
-// `x0Host` (optional) is a grid-sized host pressure array used as the CG
-// initial guess (pressure warm start); pass nullptr to start from zero.
+// `useWarmStart` != 0 seeds CG from the device-resident previous pressure
+// (managed internally by the CUDA implementation); `airDensityRatio` scales
+// CELL_AIR_ACTIVE gradient terms (pass 0 for the free-surface-only path).
 int solvePressureCUDA(void* grid, float dt, float rho,
                       int maxIterations, float tolerance,
-                      const float* x0Host);
+                      int useWarmStart, float airDensityRatio);
 
 // GPU SDF collision pass.  Pushes penetrating particles out along the SDF
 // gradient and zeroes inward velocity.  Returns number of pushed particles,

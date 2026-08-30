@@ -186,6 +186,7 @@ void FlipSolver::setObstacleSDF(const float* sdf, size_t count) {
     obstacleSDF_.resize(nx, ny, nz, 1e6f);
     std::memcpy(obstacleSDF_.data(), sdf, count * sizeof(float));
     hasObstacleSDF_ = true;
+    ++obstacleSdfRevision_; // invalidates the GPU collision path's device copy
 }
 
 float FlipSolver::sampleObstacleSDF(const Vec3& idxPos) const {
@@ -376,13 +377,17 @@ void FlipSolver::advectParticleLocalSubstepped(size_t i, float dtAct) {
 void FlipSolver::substep(float dtGrid) {
     if (positions_.empty()) { lastGridDt_ = dtGrid; return; }
 
+    // Function-scope so the G2P/advection stages below can use them (the
+    // stage braces only exist for the perf counters).
+    bool stFlip = settings_.stFlipEnabled;
+    size_t n = positions_.size();
+
+    { ScopedStage _stageP2G(*this, SG_P2G); // splat + phase-field deposit
     grid_.clearVelocities();
     grid_.clearWeights();
     grid_.cellWeight.fill(0.f);
 
-    bool stFlip = settings_.stFlipEnabled;
     float divisor = (lastGridDt_ > 1e-8f) ? lastGridDt_ : dtGrid;
-    size_t n = positions_.size();
 
     // --- Spatiotemporal P2G: deposit velocity AND phase-field mass, both
     // weighted by the same temporal kernel evaluated at each particle's
@@ -397,28 +402,39 @@ void FlipSolver::substep(float dtGrid) {
         grid_.addCellWeight(idx, wT);
     }
     grid_.normalizeBySplatWeight();
+    }
+
+    { ScopedStage _stageCls(*this, SG_CLASSIFY);
     classifyCells();
+    }
 
     int effectiveExtrapIters = std::max(settings_.extrapolateIterations,
                                          (int)std::ceil(settings_.cflNumber) + 2);
 
+    { ScopedStage _stageEx1(*this, SG_EXTRAP);
     grid_.extrapolateAll(effectiveExtrapIters, fluidBoundsPadded_);
     grid_.snapshotVelocities();
+    }
 
+    { ScopedStage _stageGrav(*this, SG_GRAVITY);
     grid_.addGravity(dtGrid, settings_.gravity);
     grid_.zeroSolidNormalVelocities();
+    }
 
     int pressureIters = 0;
     bool solved = false;
 
     // Adaptive CG iteration cap: grow when the solve hits the ceiling, relax
-    // toward the minimum when it converges early.
+    // toward the minimum when it converges early. (Function scope: the
+    // adaptive update after the solve reads maxIters.)
     int maxIters = settings_.pressureIterations;
     if (settings_.adaptivePressureIterations) {
         if (adaptiveMaxIters_ < settings_.pressureMinIterations)
             adaptiveMaxIters_ = settings_.pressureIterations;
         maxIters = adaptiveMaxIters_;
     }
+
+    { ScopedStage _stagePress(*this, SG_PRESSURE); // CG solve incl. transfers
 
     const float* warm = nullptr;
     if (settings_.pressureWarmStart) {
@@ -429,11 +445,13 @@ void FlipSolver::substep(float dtGrid) {
 #ifdef FLIP_HAS_CUDA
     if (settings_.solverBackend == SolverBackend::CUDA && settings_.airBandCells <= 0) {
         pressureIters = solvePressureCUDA(&grid_, dtGrid, settings_.density,
-                                          maxIters, settings_.pressureTolerance, warm);
+                                          maxIters, settings_.pressureTolerance,
+                                          settings_.pressureWarmStart ? 1 : 0,
+                                          settings_.airDensityRatio);
         if (pressureIters >= 0) {
-            // The CUDA kernel only solves for pressure; the velocity
-            // projection back onto the MAC grid runs on the host.
-            projectPressureVelocities(grid_, dtGrid, settings_.density);
+            // The device path also performs the velocity projection and the
+            // solid-face zeroing; pressure/velocities never round-trip the
+            // host here (pressure stays resident as the next warm start).
             solved = true;
         }
         // pressureIters < 0 means CUDA failed at runtime -> CPU fallback below
@@ -446,6 +464,9 @@ void FlipSolver::substep(float dtGrid) {
                                       settings_.pressureTolerance, warm,
                                       settings_.airBandCells > 0 ? settings_.airDensityRatio : 0.f);
     }
+    lastPressureIters_ = pressureIters;
+
+    } // SG_PRESSURE
 
     if (settings_.adaptivePressureIterations) {
         if (pressureIters >= maxIters - 1) {
@@ -454,18 +475,23 @@ void FlipSolver::substep(float dtGrid) {
             adaptiveMaxIters_ = std::max(settings_.pressureMinIterations, adaptiveMaxIters_ - 1);
         }
     }
-    if (settings_.pressureWarmStart) {
+    if (!solved && settings_.pressureWarmStart) {
+        // The CUDA path keeps its warm-start pressure device-resident; this
+        // host snapshot is only meaningful for the CPU solver.
         size_t pn = size_t(grid_.nx()) * grid_.ny() * grid_.nz();
         if (pressureGuess_.size() != pn) pressureGuess_.resize(grid_.nx(), grid_.ny(), grid_.nz(), 0.f);
         std::memcpy(pressureGuess_.data(), grid_.pressure.data(), pn * sizeof(float));
     }
 
+    { ScopedStage _stageEx2(*this, SG_EXTRAP);
     grid_.extrapolateAll(effectiveExtrapIters, fluidBoundsPadded_);
+    }
 
     float flip = clampf(settings_.flipRatio, 0.f, 1.f);
     float h = grid_.h();
     long long numParticles = (long long)n;
 
+    { ScopedStage _stageG2P(*this, SG_G2P); // FLIP/PIC velocity blend
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
@@ -476,12 +502,14 @@ void FlipSolver::substep(float dtGrid) {
         Vec3 flipVel = velocities_[i] + grid_.sampleVelocityDelta(idx);
         velocities_[i] = flip * flipVel + (1.f - flip) * picVel;
     }
+    }
 
     // --- Temporal jitter, residual carryover, and locally sub-stepped
     // advection (Sec 3.5, Algorithm 1 lines 23-29). This is what lets the
     // NEXT grid step be large without aliasing: each particle ends this
     // step at its own randomized sample time within the slab, not exactly
     // at dtGrid.
+    { ScopedStage _stageAdv(*this, SG_ADVECT); // jitter + sub-stepped advection
     #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 64)
     #endif
@@ -501,14 +529,19 @@ void FlipSolver::substep(float dtGrid) {
         }
         advectParticleLocalSubstepped(i, dtAct);
     }
+    }
 
+    { ScopedStage _stageCol(*this, SG_COLLIDE);
     resolveObstacleCollisions();
+    }
 
     // Houdini-parity post-passes (each disabled by default -> exact no-ops).
+    { ScopedStage _stagePost(*this, SG_POST);
     if (settings_.viscosityStrength > 0.f) applyViscosity(dtGrid);
     if (settings_.surfaceTensionStrength > 0.f) applySurfaceTension(dtGrid);
     if (settings_.vorticityConfinement > 0.f) applyVorticityConfinement(dtGrid);
     if (settings_.reseedEnabled) reseedParticles();
+    }
 
     lastGridDt_ = dtGrid;
     stepCounter_++;

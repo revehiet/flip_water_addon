@@ -318,6 +318,21 @@ PYBIND11_MODULE(flip_solver_core, m) {
              },
              py::arg("sdf"))
         .def("step", &FlipSolver::step, py::arg("dt"))
+    .def("reset_stage_timings", &FlipSolver::resetStageTimings,
+         "Zero all per-stage accumulators (see stage_timings)")
+    .def("last_pressure_iterations", &FlipSolver::lastPressureIterations,
+         "CG iterations of the most recent pressure solve (-1 on fallback)")
+    .def("stage_timings", [](const FlipSolver& s) {
+              // Returns [(ms_total, calls), ...] ordered like stage_names.
+              py::list out;
+              for (int i = 0; i < int(FlipSolver::SG_COUNT); ++i) {
+                  const auto& t = s.stageTiming(i);
+                  out.append(py::make_tuple(t.ms, t.calls));
+              }
+              return out;
+          },
+         "Accumulated (milliseconds, call-count) per solver stage since the "
+         "last reset_stage_timings()")
         .def("particle_count", &FlipSolver::particleCount)
         .def("get_positions", [](const FlipSolver& s) { return toNumpy(s.positionsFlat()); })
         .def("get_render_positions", [](const FlipSolver& s) { return toNumpy(s.renderPositionsFlat()); })

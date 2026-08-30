@@ -4,8 +4,13 @@ import numpy as np
 
 from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(_REPO_ROOT))
-from flip_water_addon import solver_bridge
+# The addon package's __init__ imports bpy, which doesn't exist outside
+# Blender — load solver_bridge.py (stdlib-only) directly by file path.
+import importlib.util
+_spec = importlib.util.spec_from_file_location(
+    "solver_bridge", _REPO_ROOT / "solver_bridge.py")
+solver_bridge = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(solver_bridge)
 
 core, err = solver_bridge.load()
 assert core is not None, err

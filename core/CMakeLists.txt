@@ -59,9 +59,12 @@ if(FLIP_ENABLE_CUDA)
         -diag-suppress 177,546
         -I "${CMAKE_CURRENT_SOURCE_DIR}/include"
       )
-      foreach(_arch 61 75 86)
+      foreach(_arch 61 75 86 89 90 120)
         list(APPEND NVCC_FLAGS -gencode "arch=compute_${_arch},code=sm_${_arch}")
       endforeach()
+      # PTX fallback so future architectures (JIT) still run instead of
+      # silently dropping to the CPU backend.
+      list(APPEND NVCC_FLAGS -gencode "arch=compute_61,code=compute_61")
       if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         list(APPEND NVCC_FLAGS -G)
       endif()
