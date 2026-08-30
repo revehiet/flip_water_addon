@@ -178,6 +178,12 @@ struct GpuScratch {
     GpuBuf b, x, r, p, z, Ap, diag, counter;
     GpuBuf posX, posY, posZ, velX, velY, velZ, sdf;
     PinnedBuf up, down;
+    // Velocity-extrapolation scratch (reused for u/v/w sequentially, sized to
+    // the largest staggered array). This stage was the #1 CUDA-path profile
+    // item as a serial CPU triple loop; the GPU dilation port lives in
+    // extrapolateAllCUDA below.
+    GpuBuf exF1, exF2, exW, exV1, exV2;
+    PinnedBuf exStage;
     cublasHandle_t cublas = nullptr;
     bool cublasOk = false;
     // SDF device-copy provenance: re-upload only when the host field differs
@@ -399,6 +405,51 @@ __global__ void zeroSolidW_kernel(const signed char* __restrict__ cellType,
     if (sbk || sf) w[idx] = 0.f;
 }
 
+// ── GPU velocity extrapolation (parallel dilation) ─────────────────────────
+// Exact port of MacGrid::extrapolateField semantics: the valid set is seeded
+// from splat weights (>1e-6) only, each iteration copies values from in-box
+// valid 6-neighbors (averaged) into invalid cells, neighbor scans are
+// confined to the box, and the loop stops when an iteration changes nothing.
+
+__global__ void extrapInitValid_kernel(
+    const float* __restrict__ wgt, unsigned char* __restrict__ valid,
+    int fnx, int fny,
+    int bi0, int bsx, int bj0, int bsy, int bk0, int bsz)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= bsx * bsy * bsz) return;
+    int k = t / (bsx * bsy), rem = t % (bsx * bsy), j = rem / bsx, i = rem % bsx;
+    size_t g = size_t(bi0 + i) + fnx * (size_t(bj0 + j) + fny * size_t(bk0 + k));
+    valid[t] = (wgt[g] > 1e-6f) ? 1 : 0;
+}
+
+__global__ void extrapDilate_kernel(
+    const float* __restrict__ fIn, float* __restrict__ fOut,
+    const unsigned char* __restrict__ validIn, unsigned char* __restrict__ validOut,
+    int* __restrict__ changed,
+    int fnx, int fny,
+    int bi0, int bsx, int bj0, int bsy, int bk0, int bsz)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= bsx * bsy * bsz) return;
+    int k = t / (bsx * bsy), rem = t % (bsx * bsy), j = rem / bsx, i = rem % bsx;
+    size_t g = size_t(bi0 + i) + fnx * (size_t(bj0 + j) + fny * size_t(bk0 + k));
+    if (validIn[t]) { fOut[g] = fIn[g]; validOut[t] = 1; return; }
+    float sum = 0.f; int cnt = 0;
+    #pragma unroll
+    for (int n = 0; n < 6; ++n) {
+        int di = (n == 0) - (n == 1);
+        int dj = (n == 2) - (n == 3);
+        int dk = (n == 4) - (n == 5);
+        int ni = i + di, nj = j + dj, nk = k + dk;
+        if (ni < 0 || ni >= bsx || nj < 0 || nj >= bsy || nk < 0 || nk >= bsz) continue;
+        if (!validIn[ni + bsx * (nj + bsy * nk)]) continue;
+        sum += fIn[g + di + fnx * dj + fnx * fny * dk]; ++cnt;
+    }
+    if (cnt > 0) { fOut[g] = sum / cnt; validOut[t] = 1; atomicOr(changed, 1); }
+    else         { fOut[g] = fIn[g];  validOut[t] = 0; }
+}
+
 } // anonymous namespace
 
 // ── public entry point ─────────────────────────────────────────────────────
@@ -608,6 +659,93 @@ extern "C" int solvePressureCUDA(void* pg, float dt, float rho,
     std::memcpy(grid.w.data(), static_cast<const char*>(down) + (nu + nv) * sizeof(float), nw * sizeof(float));
 
     return iter;
+}
+
+// ── GPU velocity extrapolation ─────────────────────────────────────────────
+// Parallel-dilation port of MacGrid::extrapolateAll with identical semantics:
+// valid set seeded from splat weights (>1e-6), each iteration averages values
+// from in-box valid 6-neighbors into invalid cells, early-exit when an
+// iteration changes nothing. Per field: pinned upload of f+weights, device
+// ping-pong dilation, download. On any CUDA error the host field is untouched
+// and -1 is returned so the caller falls back to the CPU path (re-running the
+// host extrapolation is idempotent given the same valid set, so a mid-way
+// fallback after earlier fields succeeded is safe).
+
+extern "C" int extrapolateAllCUDA(void* pg, int iterations,
+                                  int i0, int i1, int j0, int j1, int k0, int k1)
+{
+    if (iterations <= 0) return 0;
+    flipcore::MacGrid& grid = *static_cast<flipcore::MacGrid*>(pg);
+    GpuScratch& S = scratch();
+
+    const int nx = grid.nx(), ny = grid.ny(), nz = grid.nz();
+    if (i0 > i1 || j0 > j1 || k0 > k1) return 0; // matches CellBounds::empty()
+
+    const int block = 256;
+
+    auto runField = [&](float* f, const float* wgt,
+                        int fnx, int fny, int fnz,
+                        int bi0, int bi1, int bj0, int bj1, int bk0, int bk1) -> bool {
+        bi0 = std::max(0, bi0); bi1 = std::min(fnx - 1, bi1);
+        bj0 = std::max(0, bj0); bj1 = std::min(fny - 1, bj1);
+        bk0 = std::max(0, bk0); bk1 = std::min(fnz - 1, bk1);
+        if (bi0 > bi1 || bj0 > bj1 || bk0 > bk1) return true; // empty sub-box
+        const int bsx = bi1 - bi0 + 1, bsy = bj1 - bj0 + 1, bsz = bk1 - bk0 + 1;
+        const size_t elems = size_t(fnx) * fny * fnz;
+        const size_t fBytes = elems * sizeof(float);
+
+        float* dF1 = static_cast<float*>(S.exF1.acquire(fBytes));
+        float* dF2 = static_cast<float*>(S.exF2.acquire(fBytes));
+        float* dW  = static_cast<float*>(S.exW.acquire(fBytes));
+        unsigned char* dV1 = static_cast<unsigned char*>(S.exV1.acquire(elems));
+        unsigned char* dV2 = static_cast<unsigned char*>(S.exV2.acquire(elems));
+        void* stage = S.exStage.acquire(2 * fBytes);
+        int* dChanged = static_cast<int*>(S.counter.acquire(sizeof(int)));
+        if (!dF1 || !dF2 || !dW || !dV1 || !dV2 || !stage || !dChanged) return false;
+
+        std::memcpy(stage, f, fBytes);
+        std::memcpy(static_cast<char*>(stage) + fBytes, wgt, fBytes);
+        if (!cok(cudaMemcpy(dF1, stage, fBytes, cudaMemcpyHostToDevice), "ex up f")) return false;
+        if (!cok(cudaMemcpy(dW, static_cast<const char*>(stage) + fBytes, fBytes,
+                            cudaMemcpyHostToDevice), "ex up w")) return false;
+        // Second ping-pong buffer must carry valid out-of-box data (the full
+        // array is downloaded at the end whichever buffer it lands in).
+        if (!cok(cudaMemcpy(dF2, dF1, fBytes, cudaMemcpyDeviceToDevice), "ex seed f2")) return false;
+
+        dim3 gd(unsigned((size_t(bsx) * bsy * bsz + block - 1) / block));
+        extrapInitValid_kernel<<<gd, block>>>(dW, dV1, fnx, fny,
+                                              bi0, bsx, bj0, bsy, bk0, bsz);
+        if (!cok(cudaGetLastError(), "ex init")) return false;
+
+        float* cur = dF1; float* nxt = dF2;
+        unsigned char* vCur = dV1; unsigned char* vNxt = dV2;
+        for (int it = 0; it < iterations; ++it) {
+            if (!cok(cudaMemset(dChanged, 0, sizeof(int)), "ex zero changed")) return false;
+            extrapDilate_kernel<<<gd, block>>>(cur, nxt, vCur, vNxt, dChanged,
+                                               fnx, fny, bi0, bsx, bj0, bsy, bk0, bsz);
+            if (!cok(cudaGetLastError(), "ex dilate")) return false;
+            int changed = 0;
+            if (!cok(cudaMemcpy(&changed, dChanged, sizeof(int), cudaMemcpyDeviceToHost),
+                     "ex changed")) return false;
+            float* tF = cur; cur = nxt; nxt = tF;
+            unsigned char* tV = vCur; vCur = vNxt; vNxt = tV;
+            if (!changed) break;
+        }
+
+        if (!cok(cudaMemcpy(stage, cur, fBytes, cudaMemcpyDeviceToHost), "ex down f")) return false;
+        std::memcpy(f, stage, fBytes);
+        return true;
+    };
+
+    // Per-field box padding identical to MacGrid::extrapolateAll: each
+    // staggered field's own axis extends +1 so its face range is covered.
+    if (!runField(grid.u.data(), grid.uWeight.data(), nx + 1, ny, nz,
+                  i0, i1 + 1, j0, j1, k0, k1)) return -1;
+    if (!runField(grid.v.data(), grid.vWeight.data(), nx, ny + 1, nz,
+                  i0, i1, j0, j1 + 1, k0, k1)) return -1;
+    if (!runField(grid.w.data(), grid.wWeight.data(), nx, ny, nz + 1,
+                  i0, i1, j0, j1, k0, k1 + 1)) return -1;
+    return 0;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

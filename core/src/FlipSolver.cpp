@@ -412,7 +412,17 @@ void FlipSolver::substep(float dtGrid) {
                                          (int)std::ceil(settings_.cflNumber) + 2);
 
     { ScopedStage _stageEx1(*this, SG_EXTRAP);
-    grid_.extrapolateAll(effectiveExtrapIters, fluidBoundsPadded_);
+    bool gpuExtrap = false;
+    #ifdef FLIP_HAS_CUDA
+    if (settings_.solverBackend == SolverBackend::CUDA) {
+        gpuExtrap = extrapolateAllCUDA(&grid_, effectiveExtrapIters,
+                                       fluidBoundsPadded_.iMin, fluidBoundsPadded_.iMax,
+                                       fluidBoundsPadded_.jMin, fluidBoundsPadded_.jMax,
+                                       fluidBoundsPadded_.kMin, fluidBoundsPadded_.kMax) == 0;
+    }
+    #endif
+    if (!gpuExtrap)
+        grid_.extrapolateAll(effectiveExtrapIters, fluidBoundsPadded_);
     grid_.snapshotVelocities();
     }
 
@@ -484,7 +494,17 @@ void FlipSolver::substep(float dtGrid) {
     }
 
     { ScopedStage _stageEx2(*this, SG_EXTRAP);
-    grid_.extrapolateAll(effectiveExtrapIters, fluidBoundsPadded_);
+    bool gpuExtrap2 = false;
+    #ifdef FLIP_HAS_CUDA
+    if (settings_.solverBackend == SolverBackend::CUDA) {
+        gpuExtrap2 = extrapolateAllCUDA(&grid_, effectiveExtrapIters,
+                                        fluidBoundsPadded_.iMin, fluidBoundsPadded_.iMax,
+                                        fluidBoundsPadded_.jMin, fluidBoundsPadded_.jMax,
+                                        fluidBoundsPadded_.kMin, fluidBoundsPadded_.kMax) == 0;
+    }
+    #endif
+    if (!gpuExtrap2)
+        grid_.extrapolateAll(effectiveExtrapIters, fluidBoundsPadded_);
     }
 
     float flip = clampf(settings_.flipRatio, 0.f, 1.f);

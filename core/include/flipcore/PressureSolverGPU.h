@@ -20,6 +20,13 @@ int solvePressureCUDA(void* grid, float dt, float rho,
 // or -1 on error.
 int resolveObstacleCollisionsCUDA(void* solver);
 
+// GPU velocity extrapolation (parallel dilation port of
+// MacGrid::extrapolateAll).  i0..k1 is the CELL box (fluidBoundsPadded_).
+// Returns 0 on success (host u/v/w updated in place), -1 on error (host
+// untouched; caller falls back to the CPU path).
+int extrapolateAllCUDA(void* grid, int iterations,
+                       int i0, int i1, int j0, int j1, int k0, int k1);
+
 #ifdef __cplusplus
 }
 #endif
