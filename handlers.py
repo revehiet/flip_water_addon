@@ -87,6 +87,8 @@ def flip_water_depsgraph_update(scene, depsgraph=None):
     _check_obstacle_transforms(scene)
     operators.sync_seed_previews_from_node_graph(bpy.context)
     operators.sync_mpm_seed_previews_from_node_graph(bpy.context)
+    from . import operators_dsph
+    operators_dsph.sync_dsph_seed_previews_from_node_graph(bpy.context)
     panels.apply_npanel_node_widths()
     # Fluid Mesher dataflow: (re)generate live surfaces the moment a Surface
     # node is added/connected — no scrub or manual Reconstruct needed.

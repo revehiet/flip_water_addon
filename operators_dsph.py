@@ -22,6 +22,7 @@ from . import preview_overlay
 
 _PREVIEW_LIVE_COLOR = (1.0, 0.55, 0.10, 0.9)     # orange, like MPM bake points
 _PREVIEW_CACHE_COLOR = (0.55, 0.30, 0.95, 0.85)  # purple, cached DSPH points
+_PREVIEW_SEED_COLOR = (0.20, 0.85, 1.00, 0.90)   # cyan, DSPH seed preview
 
 # (tree_name, node_name) -> {'cancel': bool, 'run': DsphRun}
 _ACTIVE_RUNS = {}
@@ -72,51 +73,114 @@ def _box_spec(lo, hi, fill="full"):
     return {"point": (lo.x, lo.y, lo.z), "size": size, "fill": fill}
 
 
+def _union_aabb(specs):
+    """Union of box specs ({'point','size'}) as (lo, hi) Vectors, else (None, None)."""
+    lo = hi = None
+    for spec in specs:
+        p = Vector(spec["point"])
+        s = Vector(spec["size"])
+        phi = p + s
+        if lo is None:
+            lo, hi = p, phi
+        else:
+            lo = Vector((min(lo.x, p.x), min(lo.y, p.y), min(lo.z, p.z)))
+            hi = Vector((max(hi.x, phi.x), max(hi.y, phi.y), max(hi.z, phi.z)))
+    return lo, hi
+
+
+def _padded_bounds(lo, hi, pad_frac=0.15, top_frac=0.5, min_pad=0.05):
+    """Expand derived bounds so particles have room; the top gets extra
+    headroom for splashes (mirrors GenCase's default simdomain +50%)."""
+    size = Vector((hi.x - lo.x, hi.y - lo.y, hi.z - lo.z))
+    pad = Vector((max(size.x * pad_frac, min_pad),
+                  max(size.y * pad_frac, min_pad),
+                  max(size.z * pad_frac, min_pad)))
+    return lo - pad, hi + Vector((pad.x, pad.y, size.z * top_frac))
+
+
+def _dsph_source_nodes(node):
+    """All upstream nodes feeding the Emitters/Colliders sockets, walking
+    through Merge/Cache chains (mirrors the MPM source traversal)."""
+    from . import panels
+    queue = []
+    for sock in node.inputs:
+        if sock.name not in ("Emitters", "Colliders"):
+            continue
+        for link in sock.links:
+            if link.from_node is not None:
+                queue.append(link.from_node)
+    out, seen = [], set()
+    while queue:
+        n = queue.pop(0)
+        if n.name in seen:
+            continue
+        seen.add(n.name)
+        bid = n.bl_idname
+        if bid == "FLIPWATER_ND_merge":
+            queue.extend(panels._linked_nodes_from_merge_inputs(n))
+        elif bid == "FLIPWATER_ND_cache":
+            queue.extend(panels._linked_nodes_from_input(n, "Data"))
+        else:
+            out.append(n)
+    return out
+
+
 def _gather_geometry(node, context):
     """Resolve (domain_min, domain_max, fluid_boxes, bound_boxes, error).
 
-    Domain input  → simulation extents (tank).
-    Colliders     → bound boxes (mkbound); Emitter objects found on that
-                    socket are routed to fluid boxes instead.
+    Emitters      → fluid boxes (setmkfluid).
+    Colliders     → bound boxes (setmkbound).
+    Domain        → optional simulation extents. When absent, the extents
+                    are derived (padded) from the emitter/collider AABBs.
     No emitter    → a default centered water block resting on the floor.
     """
     from . import panels  # deferred: panels <-> operators are mutually chatty
 
-    domain_obj, err = panels._resolve_dsph_solver_domain(node)
-    if domain_obj is None:
-        return None, None, None, None, err or "no Domain found"
-    dlo, dhi = _world_aabb(domain_obj)
+    domain_obj, _err = panels._resolve_dsph_solver_domain(node)
+    dlo = dhi = None
+    if domain_obj is not None:
+        dlo, dhi = _world_aabb(domain_obj)
 
     bound_boxes, fluid_boxes = [], []
-    for sock in node.inputs:
-        if sock.name != "Colliders":
+    for cand in _dsph_source_nodes(node):
+        obj = getattr(cand, "object", None) or \
+            getattr(cand, "emitter_object", None) or \
+            getattr(cand, "obstacle_object", None) or \
+            getattr(cand, "collider_object", None) or \
+            getattr(cand, "domain_object", None)
+        if obj is None:
             continue
-        for link in sock.links:
-            src = link.from_node
-            for cand in panels._linked_nodes_from_input(src, None) or [src]:
-                obj = getattr(cand, "object", None) or \
-                    getattr(cand, "emitter_object", None) or \
-                    getattr(cand, "obstacle_object", None) or \
-                    getattr(cand, "collider_object", None) or \
-                    getattr(cand, "domain_object", None)
-                if obj is None:
-                    continue
-                lo, hi = _world_aabb(obj)
-                is_fluid = ("emitter" in cand.bl_idname.lower()
-                            or getattr(obj, "flip_water_is_emitter", False))
-                if is_fluid:
-                    fluid_boxes.append(_box_spec(lo, hi))
-                else:
-                    bound_boxes.append(_box_spec(lo, hi))
+        lo, hi = _world_aabb(obj)
+        is_fluid = ("emitter" in cand.bl_idname.lower()
+                    or getattr(obj, "flip_water_is_emitter", False))
+        if is_fluid:
+            fluid_boxes.append(_box_spec(lo, hi))
+        else:
+            bound_boxes.append(_box_spec(lo, hi))
 
     if not fluid_boxes:
         # Default dam-break-style block: 60% x 50% footprint, 40% height,
-        # centered, resting on the domain floor.
+        # centered, resting on the floor.
+        if dlo is None or dhi is None:
+            dlo, dhi = _union_aabb(bound_boxes)
+            if dlo is None:
+                return None, None, None, None, (
+                    "At least an Emitter (fluid source) or a Domain is needed "
+                    "to define the SPH fluid volume.")
+            dlo, dhi = _padded_bounds(dlo, dhi)
         cx, cy = (dlo.x + dhi.x) * 0.5, (dlo.y + dhi.y) * 0.5
         sx, sy, sz = dhi.x - dlo.x, dhi.y - dlo.y, dhi.z - dlo.z
         fluid_boxes.append(_box_spec(
             Vector((cx - 0.3 * sx, cy - 0.25 * sy, dlo.z + 1e-3)),
             Vector((cx + 0.3 * sx, cy + 0.25 * sy, dlo.z + 0.4 * sz))))
+
+    if dlo is None or dhi is None:
+        dlo, dhi = _union_aabb(fluid_boxes + bound_boxes)
+        if dlo is None:
+            return None, None, None, None, (
+                "Connect an Emitter and/or Collider to define the simulation "
+                "volume.")
+        dlo, dhi = _padded_bounds(dlo, dhi)
     return (dlo, dhi), fluid_boxes, bound_boxes, domain_obj, None
 
 
@@ -198,6 +262,8 @@ class FLIPWATER_OT_bake_dsph(bpy.types.Operator):
         shutil.rmtree(cache_dir, ignore_errors=True)
 
         try:
+            kernel_map = {"CUBIC": 1, "WENDLAND": 2}
+            visco_map = {"ARTIFICIAL": 1, "LAMINAR_SPS": 2, "LAMINAR": 3}
             def_path = dsph.write_case(
                 case_dir, "case",
                 dp=dp,
@@ -205,6 +271,14 @@ class FLIPWATER_OT_bake_dsph(bpy.types.Operator):
                 domain_max=(dhi.x, dhi.y, dhi.z),
                 fluid_boxes=fluid_boxes, bound_boxes=bound_boxes,
                 visco=float(getattr(node, "dsph_viscosity", 0.02)),
+                gravity=tuple(float(v) for v in
+                              getattr(node, "dsph_gravity", (0.0, 0.0, -9.81))),
+                rhop0=float(getattr(node, "dsph_density", 1000.0)),
+                kernel=kernel_map.get(getattr(node, "dsph_kernel", "CUBIC"), 1),
+                visco_treatment=visco_map.get(
+                    getattr(node, "dsph_visco_treatment", "ARTIFICIAL"), 1),
+                cflnumber=float(getattr(node, "dsph_cfl", 0.2)),
+                coefsound=float(getattr(node, "dsph_coefsound", 20.0)),
                 time_max=(frame_count - 1) * step / float(fps),
                 time_out=step / float(fps))
             out_base = os.path.join(case_dir, "case")
@@ -391,6 +465,145 @@ class FLIPWATER_OT_free_dsph_cache(bpy.types.Operator):
             pass
         self.report({'INFO'}, "DualSPHysics cache freed: %s" % cache_dir)
         return {'FINISHED'}
+# ---- DSPH seed preview (mirrors the FLIP/MPM seed-preview trio) ----
+# State keyed by (tree_name, node_name), like the MPM seed preview.
+_dsph_seed_previews = {}       # key -> signature describing current sources
+_dsph_seed_matrix_cache = {}   # object name -> last world-matrix tuple
+_dsph_seed_points_cache = {}   # key -> True once points were built
+
+
+def _dsph_seed_key(tree_name, node_name):
+    return "dsph_seed:%s:%s" % (tree_name, node_name)
+
+
+def _obj_matrix_key(obj):
+    return tuple(tuple(row) for row in obj.matrix_world)
+
+
+def _dsph_source_objects(node):
+    """Emitter objects feeding the DSPH node (Emitters/Colliders sockets)."""
+    objs = []
+    for cand in _dsph_source_nodes(node):
+        obj = getattr(cand, "emitter_object", None)
+        if obj is None:
+            obj = getattr(cand, "object", None)
+        is_emitter = obj is not None and obj.name in bpy.data.objects and (
+            "emitter" in cand.bl_idname.lower()
+            or getattr(obj, "flip_water_is_emitter", False))
+        if is_emitter:
+            objs.append(obj)
+    return objs
+
+
+def _fill_box_lattice(spec, dp):
+    """Fill a box spec with a regular lattice at spacing dp (half-step offset),
+    mirroring GenCase's uniform fluid fill."""
+    import math
+    p, size = spec["point"], spec["size"]
+    counts = [max(1, int(math.floor(size[i] / dp))) for i in range(3)]
+    total = counts[0] * counts[1] * counts[2]
+    if total > 1_500_000:  # keep predicted output within budget
+        scale = (1_500_000 / total) ** (1.0 / 3.0)
+        counts = [max(1, int(n * scale)) for n in counts]
+    axes = [(np.arange(n, dtype=np.float32) + 0.5) * dp + p[i]
+            for i, n in enumerate(counts)]
+    mesh = np.meshgrid(*axes, indexing="ij")
+    return np.stack([g.ravel() for g in mesh], axis=1).astype(np.float32)
+
+
+def build_dsph_seed_points(node, context):
+    """Initial SPH particle positions a bake would start from. Shares
+    _gather_geometry + the auto-dp rule with the bake operator so the preview
+    can never drift from what GenCase will actually seed."""
+    (dlo, dhi), fluid_boxes, _bounds, _dom, gerr = _gather_geometry(node, context)
+    if gerr or dlo is None or not fluid_boxes:
+        return np.zeros((0, 3), dtype=np.float32), gerr or "no fluid volume"
+    dp = float(getattr(node, "dsph_dp", 0.0) or 0.0)
+    if dp <= 1e-6:
+        dp = min(dhi.x - dlo.x, dhi.y - dlo.y, dhi.z - dlo.z) / 64.0
+    dp = max(dp, 1e-4)
+    chunks = [_fill_box_lattice(spec, dp) for spec in fluid_boxes]
+    pts = np.concatenate(chunks, axis=0).astype(np.float32)
+    if pts.shape[0] > 150000:  # viewport budget
+        step = max(1, int(np.ceil(pts.shape[0] / 150000)))
+        pts = pts[::step]
+    return np.ascontiguousarray(pts, dtype=np.float32), None
+
+
+def refresh_dsph_seed_preview(context, key):
+    """(Re)draw one DSPH node's initial-particle cloud in the viewport."""
+    tree_name, node_name = key
+    ng = bpy.data.node_groups.get(tree_name)
+    node = ng.nodes.get(node_name) if ng is not None else None
+    pkey = _dsph_seed_key(*key)
+    if node is None:
+        preview_overlay.clear_particle_preview(pkey)
+        return
+    pts, _err = build_dsph_seed_points(node, context)
+    if pts.shape[0] == 0:
+        preview_overlay.clear_particle_preview(pkey)
+        return
+    preview_overlay.set_particle_preview(
+        pkey, pts, color=_PREVIEW_SEED_COLOR, point_size=2.0, style='POINTS')
+    _dsph_seed_points_cache[key] = True
+
+
+def sync_dsph_seed_previews_from_node_graph(context):
+    """Keep DSPH seed clouds in sync with the node graph (mirrors the FLIP and
+    MPM sync functions). Hides the preview while a bake is running."""
+    from . import panels
+    props = getattr(context.scene, "flip_water_dsph", None)
+    baking = bool(props is not None and props.is_baking)
+    desired = {}
+    for tree in bpy.data.node_groups:
+        if tree.bl_idname != panels.TREE_IDNAME:
+            continue
+        for node in tree.nodes:
+            if node.bl_idname != "FLIPWATER_ND_dsph_solver":
+                continue
+            if baking or not getattr(node, "dsph_seed_preview", False):
+                continue
+            domain_obj, _err = panels._resolve_dsph_solver_domain(node)
+            sources = tuple(sorted(
+                (o.name, _obj_matrix_key(o)) for o in _dsph_source_objects(node)))
+            desired[(tree.name, node.name)] = {
+                "dp": float(getattr(node, "dsph_dp", 0.0) or 0.0),
+                "domain": domain_obj.name if domain_obj is not None else "",
+                "sources": sources,
+            }
+    for key in list(_dsph_seed_previews.keys()):
+        if key not in desired:
+            preview_overlay.clear_particle_preview(_dsph_seed_key(*key))
+            _dsph_seed_previews.pop(key, None)
+            _dsph_seed_points_cache.pop(key, None)
+    for key, sig in desired.items():
+        changed = _dsph_seed_previews.get(key) != sig
+        _dsph_seed_previews[key] = sig
+        if changed or key not in _dsph_seed_points_cache:
+            refresh_dsph_seed_preview(context, key)
+    _check_dsph_source_transforms(context)
+
+
+def _check_dsph_source_transforms(context):
+    """Refresh DSPH seed previews whose source objects moved/rotated/scaled."""
+    if not _dsph_seed_previews:
+        return
+    dirty = set()
+    for key in list(_dsph_seed_previews.keys()):
+        ng = bpy.data.node_groups.get(key[0])
+        node = ng.nodes.get(key[1]) if ng is not None else None
+        if node is None:
+            continue
+        for obj in _dsph_source_objects(node):
+            mk = _obj_matrix_key(obj)
+            cached = _dsph_seed_matrix_cache.get(obj.name)
+            _dsph_seed_matrix_cache[obj.name] = mk
+            if cached is not None and cached != mk:
+                dirty.add(key)
+    for key in dirty:
+        refresh_dsph_seed_preview(context, key)
+
+
 
 
 # ── run-status helpers (bridge-API tolerant) ───────────────────────────────
@@ -468,33 +681,50 @@ def refresh_dsph_cache_previews(frame=None):
     """Show cached DSPH particles in the viewport for the current frame.
 
     Mirrors the FLIP/MPM cache-preview behaviour: purple point cloud when the
-    current frame exists in this node's FWC cache, nothing otherwise. Kept
-    cheap: one has_frame() probe per solver node.
+    current frame exists in this node's FWC cache, nothing otherwise. The
+    per-cache 'Preview Points' toggle (dsph_preview_enabled) gates each Cache
+    node feeding a DSPH solver.
     """
     try:
         import bpy as _bpy  # already imported at module level; keeps lint calm
         del _bpy
     except Exception:  # noqa: BLE001 - headless
         return
-    for tree, node in _iter_dsph_solver_nodes():
-        key = _overlay_cache_key(tree.name, node.name)
-        cache_dir = _dsph_cache_dir_for(node.name)
-        try:
-            if frame is None or not cache_io.has_frame(cache_dir, int(frame)):
-                preview_overlay.clear_particle_preview(key)
+    from . import panels  # deferred: cache-node resolver lives in panels
+    seen = set()
+    for tree in bpy.data.node_groups:
+        if tree.bl_idname != panels.TREE_IDNAME:
+            continue
+        for node in tree.nodes:
+            if node.bl_idname != "FLIPWATER_ND_cache":
                 continue
-            pos, _vel = cache_io.read_frame(cache_dir, int(frame))
-            if pos is None or pos.shape[0] == 0:
-                preview_overlay.clear_particle_preview(key)
+            dsph_node = panels._resolve_dsph_solver_from_cache(node)
+            if dsph_node is None:
                 continue
-            n = pos.shape[0]
-            if n > 100000:  # viewport budget: at most ~100k preview points
-                pos = np.ascontiguousarray(pos[::max(1, n // 100000)])
-            preview_overlay.set_particle_preview(
-                key, np.ascontiguousarray(pos, dtype=np.float32),
-                color=_PREVIEW_CACHE_COLOR)
-        except Exception:  # noqa: BLE001 - previews must never break playback
-            preview_overlay.clear_particle_preview(key)
+            key = _overlay_cache_key(tree.name, dsph_node.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            cache_dir = _dsph_cache_dir_for(dsph_node.name)
+            try:
+                if not getattr(node, "dsph_preview_enabled", True):
+                    preview_overlay.clear_particle_preview(key)
+                    continue
+                if frame is None or not cache_io.has_frame(cache_dir, int(frame)):
+                    preview_overlay.clear_particle_preview(key)
+                    continue
+                pos, _vel = cache_io.read_frame(cache_dir, int(frame))
+                if pos is None or pos.shape[0] == 0:
+                    preview_overlay.clear_particle_preview(key)
+                    continue
+                n = pos.shape[0]
+                if n > 100000:  # viewport budget: at most ~100k preview points
+                    pos = np.ascontiguousarray(pos[::max(1, n // 100000)])
+                preview_overlay.set_particle_preview(
+                    key, np.ascontiguousarray(pos, dtype=np.float32),
+                    color=_PREVIEW_CACHE_COLOR)
+            except Exception:  # noqa: BLE001 - previews must never break playback
+                preview_overlay.clear_particle_preview(key)
 
 
 _CLASSES = (

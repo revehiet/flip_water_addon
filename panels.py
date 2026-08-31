@@ -264,9 +264,8 @@ def _resolve_cache_stage(cache_node):
         return 'MPM', domain_obj, ""
 
     if src.bl_idname == "FLIPWATER_ND_dsph_solver":
-        domain_obj, err = _resolve_dsph_solver_domain(src)
-        if domain_obj is None:
-            return None, None, err
+        domain_obj, _err = _resolve_dsph_solver_domain(src)
+        # Domain is optional for SPH - emitters/colliders define the volume.
         return 'DSPH', domain_obj, ""
 
     if src.bl_idname == "FLIPWATER_ND_surface":
@@ -650,6 +649,29 @@ def _draw_cache_properties(layout, obj, cache_dir=None):
     if stats["n_frames"]:
         text = f"Disk: {stats['n_frames']} frames ({stats['first']}-{stats['last']}), {stats['total_bytes'] / 1048576.0:.1f} MB"
         box.label(text=text, icon='DISK_DRIVE')
+    else:
+        box.label(text="Disk: nothing cached yet", icon='DISK_DRIVE')
+
+
+def _draw_dsph_cache_dir(layout, dsph_node):
+    """DSPH cache directory + disk stats. Domain is optional for SPH, so the
+    shared _draw_cache_properties (which derefs flip_water_domain) cannot be
+    reused."""
+    from . import cache_io
+    from . import operators_dsph as _dsph_ops
+    box = layout.box()
+    box.label(text="Particle Cache", icon='FILE_CACHE')
+    box.label(text="Uses scene frame range + the solver's Cache Every N Frames.",
+              icon='INFO')
+    box.prop(dsph_node, "dsph_frame_step")
+    cache_dir = _dsph_ops._dsph_cache_dir_for(dsph_node.name)
+    box.label(text=cache_dir, icon='FILE_FOLDER')
+    stats = cache_io.cache_stats(cache_dir)
+    if stats["n_frames"]:
+        box.label(
+            text=f"Disk: {stats['n_frames']} frames ({stats['first']}-{stats['last']}), "
+                 f"{stats['total_bytes'] / 1048576.0:.1f} MB",
+            icon='DISK_DRIVE')
     else:
         box.label(text="Disk: nothing cached yet", icon='DISK_DRIVE')
 
@@ -1333,6 +1355,11 @@ class FLIPWATER_ND_cache(_FLIPWATER_NodeBase, bpy.types.Node):
         default=True,
         description="Draw the simulated MPM particles in the viewport at the "
                     "current frame (from this cache)")
+    dsph_preview_enabled: bpy.props.BoolProperty(
+        name="Preview Points",
+        default=True,
+        description="Draw the cached DualSPHysics particles in the viewport at "
+                    "the current frame (from this cache)")
 
     def init(self, _context):
         self.inputs.new("FLIPWATER_NodeSocket", "Data")
@@ -1354,7 +1381,7 @@ class FLIPWATER_ND_cache(_FLIPWATER_NodeBase, bpy.types.Node):
 
     def _draw_params(self, _context, layout):
         stage, domain_obj, err = _resolve_cache_stage(self)
-        if domain_obj is None:
+        if stage is None:
             layout.label(text=err, icon='ERROR')
             return
 
@@ -1388,6 +1415,12 @@ class FLIPWATER_ND_cache(_FLIPWATER_NodeBase, bpy.types.Node):
                 mpm_dir = _ops._mpm_cache_dir_for(mpm_node.name)
             _draw_cache_properties(layout, domain_obj, cache_dir=mpm_dir)
             layout.prop(self, "mpm_preview_enabled", text="Preview Points")
+        elif stage == 'DSPH':
+            layout.label(text="Stage: DSPH Particle Cache", icon='PARTICLES')
+            dsph_node = _resolve_dsph_solver_from_cache(self)
+            if dsph_node is not None:
+                _draw_dsph_cache_dir(layout, dsph_node)
+            layout.prop(self, "dsph_preview_enabled", text="Preview Points")
         else:
             layout.label(text="Stage: Surface Cache", icon='MESH_GRID')
             props = domain_obj.flip_water_domain
@@ -1398,6 +1431,7 @@ class FLIPWATER_ND_cache(_FLIPWATER_NodeBase, bpy.types.Node):
         props = domain_obj.flip_water_domain if hasattr(domain_obj, 'flip_water_domain') else None
         mpm_props = getattr(_context.scene, "flip_water_mpm", None)
         wake_props = getattr(_context.scene, "flip_water_wake", None)
+        dsph_props = getattr(_context.scene, "flip_water_dsph", None)
 
         if stage == 'PARTICLES' and props is not None and props.is_baking:
             layout.label(text=f"Baking frame {props.bake_current_frame}...", icon='SORTTIME')
@@ -1416,6 +1450,15 @@ class FLIPWATER_ND_cache(_FLIPWATER_NodeBase, bpy.types.Node):
             mpm_node = _resolve_mpm_solver_from_cache(self)
             if mpm_node is not None:
                 op.node_name = mpm_node.name
+        elif stage == 'DSPH' and dsph_props is not None and dsph_props.is_baking:
+            layout.label(text=f"Baking DSPH frame {dsph_props.bake_current_frame}...",
+                         icon='SORTTIME')
+            layout.progress(factor=dsph_props.bake_progress,
+                            text=f"{int(dsph_props.bake_progress * 100)}%")
+            row = layout.row(align=True)
+            row.scale_y = 1.1
+            op = row.operator("flip_water.cancel_bake_dsph", text="Cancel Bake",
+                              icon='CANCEL')
         elif stage == 'WAKE' and wake_props is not None and wake_props.is_baking:
             layout.label(text=f"Baking wake frame {wake_props.bake_current_frame}...", icon='SORTTIME')
             layout.progress(factor=wake_props.bake_progress, text=f"{int(wake_props.bake_progress * 100)}%")
@@ -1444,6 +1487,19 @@ class FLIPWATER_ND_cache(_FLIPWATER_NodeBase, bpy.types.Node):
                                            text="Free", icon='TRASH')
                     op_free.node_tree_name = self.id_data.name
                     op_free.node_name = mpm_node.name
+            elif stage == 'DSPH':
+                dsph_node = _resolve_dsph_solver_from_cache(self)
+                if dsph_node is None:
+                    row.label(text="No DSPH Solver upstream", icon='ERROR')
+                else:
+                    op = row.operator("flip_water.bake_dsph", text="Bake DSPH",
+                                      icon='PLAY')
+                    op.node_tree_name = self.id_data.name
+                    op.node_name = dsph_node.name
+                    op_free = row.operator("flip_water.free_dsph_cache",
+                                           text="Free", icon='TRASH')
+                    op_free.node_tree_name = self.id_data.name
+                    op_free.node_name = dsph_node.name
             elif stage == 'WAKE':
                 op = row.operator("flip_water.bake_wake", text="Bake Wake", icon='PLAY')
                 op.node_tree_name = self.id_data.name
@@ -1726,7 +1782,9 @@ def _resolve_dsph_solver_domain(node):
                     if s2src.bl_idname == "FLIPWATER_ND_domain":
                         obj = getattr(s2src, "domain_object", None)
                         return obj, None
-    return None, "DualSPHysics Solver requires a Domain node upstream"
+    # Domain is optional for SPH: bake-time extents are derived from the
+    # emitter/collider AABBs when none is connected.
+    return None, ""
 
 
 def _resolve_mpm_solver_from_cache(cache_node):
@@ -1765,35 +1823,80 @@ def _resolve_dsph_solver_from_cache(cache_node):
 
 class FLIPWATER_ND_dsph_solver(_FLIPWATER_NodeBase, bpy.types.Node):
     """External DualSPHysics solver (subprocess bridge, LGPL exe runs outside
-    the addon). Box-based cases: the Domain defines the tank, emitters/colliders
-    are consumed as axis-aligned boxes for this first version."""
+    the addon). Box-based cases: Emitters become fluid boxes, Colliders become
+    the boundary (mkbound), and an optional Domain sets the simulation extents
+    (derived from the emitter/collider AABBs when absent)."""
     bl_idname = "FLIPWATER_ND_dsph_solver"
     bl_label = "DualSPHysics Solver"
     bl_description = ("SPH simulation via the external DualSPHysics engine. "
                       "Requires the executables path in addon preferences")
 
     dsph_dp: bpy.props.FloatProperty(
-        name="Particle Spacing dp", default=0.0, min=0.0, soft_min=0.005, soft_max=0.2,
+        name="Particle Spacing dp", default=0.05, min=0.0, soft_min=0.005, soft_max=0.2,
         precision=4, step=1,
         description="Initial inter-particle distance (m). 0 = auto "
                     "(smallest domain dimension / 64). Smaller = more particles")
     dsph_use_gpu: bpy.props.BoolProperty(
         name="Use GPU Solver", default=True,
         description="Run DualSPHysics5.4_win64 (CUDA) instead of the CPU build")
+    dsph_seed_preview: bpy.props.BoolProperty(
+        name="Seed Preview",
+        default=True,
+        description="Show the initial SPH particles in the viewport before "
+                    "baking - the emitter boxes filled at the particle "
+                    "spacing, matching what the bake will produce")
+    dsph_density: bpy.props.FloatProperty(
+        name="Fluid Density", default=1000.0, min=100.0, max=3000.0,
+        soft_min=500.0, soft_max=1300.0,
+        description="Reference density (rhop0, kg/m^3). Water: 1000, "
+                    "saltwater ~1025")
+    dsph_gravity: bpy.props.FloatVectorProperty(
+        name="Gravity", default=(0.0, 0.0, -9.81), subtype='ACCELERATION',
+        description="Gravity vector applied to the fluid (m/s^2)")
+    dsph_kernel: bpy.props.EnumProperty(
+        name="Kernel",
+        items=[
+            ("CUBIC", "Cubic Spline", "Classic cubic-spline smoothing kernel"),
+            ("WENDLAND", "Wendland", "Wendland kernel - smoother, stiffer"),
+        ],
+        default="CUBIC",
+        description="SPH smoothing kernel used by the solver")
+    dsph_visco_treatment: bpy.props.EnumProperty(
+        name="Viscosity Model",
+        items=[
+            ("ARTIFICIAL", "Artificial", "Artificial viscosity (general numerical damping)"),
+            ("LAMINAR_SPS", "Laminar + SPS", "Physical laminar viscosity + sub-particle-scale turbulence"),
+            ("LAMINAR", "Laminar", "Physical laminar viscosity only"),
+        ],
+        default="ARTIFICIAL",
+        description="DualSPHysics ViscoTreatment model")
+    dsph_cfl: bpy.props.FloatProperty(
+        name="CFL Number", default=0.2, min=0.01, max=1.0, step=0.01,
+        description="Timestep scale from the Courant-Friedrichs-Lewy condition. "
+                    "Lower = smaller, more accurate steps (slower)")
+    dsph_coefsound: bpy.props.FloatProperty(
+        name="Sound Speed Coef", default=20.0, min=1.0, max=100.0,
+        description="Speed-of-sound coefficient (CoefSound). Higher = stiffer "
+                    "fluid but smaller timesteps")
     dsph_viscosity: bpy.props.FloatProperty(
         name="Viscosity", default=0.02, min=0.0, max=1.0, step=0.01,
         description="Artificial viscosity coefficient (DSPH Visco, "
                     "ViscoTreatment=ARTIFICIAL). Water ~0.02, syrup ~0.1+")
     dsph_frame_step: bpy.props.IntProperty(
-        name="Bake Every Nth Frame", default=1, min=1, max=10,
-        description="Simulate in multiples of N scene frames to speed up "
-                    "long bakes (cache frames are placed at multiples of N)")
+        name="Cache Every N Frames", default=1, min=1, max=10,
+        description="Write one cached frame every N scene frames. The solver "
+                    "still simulates every timestep (CFL-limited, unchanged "
+                    "quality); this only decimates the cache so playback "
+                    "moves in steps of N")
 
     def init(self, _context):
         self.inputs.new("FLIPWATER_NodeSocket", "Domain")
-        self.inputs.new("FLIPWATER_NodeSocket", "Colliders")
+        sock = self.inputs.new("FLIPWATER_NodeSocket", "Emitters")
+        sock.link_limit = 0
+        sock = self.inputs.new("FLIPWATER_NodeSocket", "Colliders")
+        sock.link_limit = 0
         self.outputs.new("FLIPWATER_NodeSocket", "Data")
-        self.width = 220
+        self.width = 250
 
     @classmethod
     def poll(cls, ntree):
@@ -1806,24 +1909,38 @@ class FLIPWATER_ND_dsph_solver(_FLIPWATER_NodeBase, bpy.types.Node):
         self._draw_params(_context, layout)
 
     def _draw_params(self, context, layout):
+        domain_obj, _err = _resolve_dsph_solver_domain(self)
+        if domain_obj is not None:
+            layout.label(text=f"Domain: {domain_obj.name}", icon='CUBE')
+        else:
+            layout.label(text="No Domain - extents from Emitters/Colliders",
+                         icon='INFO')
+
+        layout.prop(self, "dsph_seed_preview", text="Seed Preview",
+                    toggle=True,
+                    icon='HIDE_OFF' if self.dsph_seed_preview else 'HIDE_ON')
+
         col = layout.column(align=True)
         col.prop(self, "dsph_dp")
         col.prop(self, "dsph_use_gpu")
-        col.prop(self, "dsph_viscosity")
-        col.prop(self, "dsph_frame_step")
 
+        box = layout.box()
+        box.label(text="Fluid", icon='MATERIAL')
+        box.prop(self, "dsph_density")
+        box.prop(self, "dsph_viscosity")
+
+        box2 = layout.box()
+        box2.label(text="Solver", icon='SETTINGS')
+        box2.prop(self, "dsph_kernel")
+        box2.prop(self, "dsph_visco_treatment")
+        box2.prop(self, "dsph_cfl")
+        box2.prop(self, "dsph_coefsound")
+        box2.prop(self, "dsph_gravity")
+
+        layout.prop(self, "dsph_frame_step")
         layout.separator()
-        props = context.scene.flip_water_dsph
-        row = layout.row(align=True)
-        if props.is_baking:
-            row.operator("flip_water.cancel_bake_dsph", text="Cancel", icon='CANCEL')
-        else:
-            op = row.operator("flip_water.bake_dsph", text="Bake", icon='MOD_FLUIDSIM')
-            op.node_tree_name = self.id_data.name
-            op.node_name = self.name
-        row.operator("flip_water.free_dsph_cache", text="Free", icon='TRASH')
-        if props.is_baking:
-            layout.prop(props, "bake_progress", slider=True)
+        layout.label(text="Bake & preview particles on the Cache node.",
+                     icon='INFO')
 
 
 class FLIPWATER_ND_mpm_solver(_FLIPWATER_NodeBase, bpy.types.Node):
