@@ -268,6 +268,12 @@ def _resolve_cache_stage(cache_node):
         # Domain is optional for SPH - emitters/colliders define the volume.
         return 'DSPH', domain_obj, ""
 
+    if src.bl_idname == "FLIPWATER_ND_smoke_solver":
+        from . import operators_smoke
+        domain_obj, _err = operators_smoke._resolve_smoke_domain(src)
+        # Domain optional: grid is derived from the Smoke Emitter(s) volume.
+        return 'SMOKE', domain_obj, ""
+
     if src.bl_idname == "FLIPWATER_ND_surface":
         domain_obj, err = _resolve_surface_domain(src)
         if domain_obj is None:
@@ -1360,6 +1366,11 @@ class FLIPWATER_ND_cache(_FLIPWATER_NodeBase, bpy.types.Node):
         default=True,
         description="Draw the cached DualSPHysics particles in the viewport at "
                     "the current frame (from this cache)")
+    smoke_preview_enabled: bpy.props.BoolProperty(
+        name="Preview Points",
+        default=True,
+        description="Draw the cached Smoke markers in the viewport at the "
+                    "current frame (from this cache)")
 
     def init(self, _context):
         self.inputs.new("FLIPWATER_NodeSocket", "Data")
@@ -1821,6 +1832,23 @@ def _resolve_dsph_solver_from_cache(cache_node):
     return None
 
 
+def _resolve_smoke_solver_from_cache(cache_node):
+    """Walk backwards from a Cache node to its upstream Smoke Solver,
+    following intermediate Cache nodes (same traversal as the MPM variant)."""
+    queue = list(_linked_nodes_from_input(cache_node, "Data"))
+    seen = set()
+    while queue:
+        node = queue.pop(0)
+        if node.name in seen:
+            continue
+        seen.add(node.name)
+        if node.bl_idname == "FLIPWATER_ND_smoke_solver":
+            return node
+        if node.bl_idname == "FLIPWATER_ND_cache":
+            queue.extend(_linked_nodes_from_input(node, "Data"))
+    return None
+
+
 class FLIPWATER_ND_dsph_solver(_FLIPWATER_NodeBase, bpy.types.Node):
     """External DualSPHysics solver (subprocess bridge, LGPL exe runs outside
     the addon). Box-based cases: Emitters become fluid boxes, Colliders become
@@ -1943,6 +1971,134 @@ class FLIPWATER_ND_dsph_solver(_FLIPWATER_NodeBase, bpy.types.Node):
                      icon='INFO')
 
 
+class FLIPWATER_ND_smoke_emitter(_FLIPWATER_NodeBase, bpy.types.Node):
+    """Smoke source: injects hot, dense smoke into the Smoke Solver grid."""
+    bl_idname = "FLIPWATER_ND_smoke_emitter"
+    bl_label = "Smoke Emitter"
+
+    emitter_object: PointerProperty(type=bpy.types.Object, name="Emitter")
+    enabled: BoolProperty(name="Enabled", default=True)
+    smoke_temperature: bpy.props.FloatProperty(
+        name="Temperature", default=3.0, min=0.0, max=20.0, step=0.1,
+        description="Heat injected per unit density - drives buoyancy")
+    smoke_density: bpy.props.FloatProperty(
+        name="Density", default=1.0, min=0.01, max=2.0, step=0.05,
+        description="Smoke density emitted (1.0 = full)")
+    smoke_emit_rate: bpy.props.FloatProperty(
+        name="Emit Rate", default=1.0, min=0.0, max=5.0, step=0.1,
+        description="Multiplier on emitted density per frame")
+    smoke_velocity: bpy.props.FloatVectorProperty(
+        name="Emit Velocity", default=(0.0, 0.0, 0.0), subtype='VELOCITY',
+        description="Initial velocity injected with the smoke")
+
+    def init(self, _context):
+        self.outputs.new("FLIPWATER_NodeSocket", "Smoke")
+        self.width = 320
+
+    def update(self):
+        if self.emitter_object is not None:
+            _safe_set(self.emitter_object, "flip_water_is_emitter", True)
+
+    def draw_buttons(self, _context, layout):
+        _update_node_width_for_mode(self)
+        if node_params_in_npanel():
+            return
+        self._draw_params(_context, layout)
+
+    def _draw_params(self, _context, layout):
+        col = layout.column(align=True)
+        col.prop(self, "emitter_object", text="Object")
+        op = col.operator("flip_water.node_assign_role", text="Use Active",
+                          icon='EYEDROPPER')
+        op.role = 'EMITTER'
+        op.node_tree_name = self.id_data.name
+        op.node_name = self.name
+        col.prop(self, "enabled")
+        col.prop(self, "smoke_temperature")
+        col.prop(self, "smoke_density")
+        col.prop(self, "smoke_emit_rate")
+        col.prop(self, "smoke_velocity")
+
+
+class FLIPWATER_ND_smoke_solver(_FLIPWATER_NodeBase, bpy.types.Node):
+    """Eulerian smoke solver (numpy MAC grid). Domain defines the grid
+    container; connected Smoke Emitters inject density/temperature/velocity.
+    Bake & preview live on the Cache node (like every other solver)."""
+    bl_idname = "FLIPWATER_ND_smoke_solver"
+    bl_label = "Smoke Solver"
+
+    smoke_resolution: bpy.props.IntProperty(
+        name="Grid Resolution", default=64, min=8, max=256,
+        description="Cells along the longest axis of the smoke grid")
+    smoke_substeps: bpy.props.IntProperty(
+        name="Substeps", default=2, min=1, max=8,
+        description="Solver sub-steps per frame. More = more accurate, slower")
+    smoke_buoyancy: bpy.props.FloatProperty(
+        name="Buoyancy", default=1.0, min=0.0, max=5.0, step=0.1,
+        description="How strongly heat contrast drives the up-draft")
+    smoke_vorticity: bpy.props.FloatProperty(
+        name="Vorticity", default=0.1, min=0.0, max=2.0, step=0.05,
+        description="Vorticity confinement (Fedkiw epsilon). Higher = more roll")
+    smoke_density_decay: bpy.props.FloatProperty(
+        name="Density Decay", default=0.05, min=0.0, max=1.0, step=0.01,
+        description="Smoke dissipation rate per second")
+    smoke_temperature_decay: bpy.props.FloatProperty(
+        name="Temp Decay", default=0.05, min=0.0, max=1.0, step=0.01,
+        description="Heat dissipation rate per second")
+    smoke_gravity: bpy.props.FloatVectorProperty(
+        name="Gravity", default=(0.0, 0.0, -9.81), subtype='ACCELERATION',
+        description="Gravity acceleration (drives density fall-off)")
+    smoke_seed_preview: bpy.props.BoolProperty(
+        name="Seed Preview", default=True,
+        description="Show the smoke emission region in the viewport before "
+                    "baking")
+
+    def init(self, _context):
+        self.inputs.new("FLIPWATER_NodeSocket", "Domain")
+        sock = self.inputs.new("FLIPWATER_NodeSocket", "Smoke")
+        sock.link_limit = 0
+        self.outputs.new("FLIPWATER_NodeSocket", "Data")
+        self.width = 250
+
+    @classmethod
+    def poll(cls, ntree):
+        return ntree.bl_idname == TREE_IDNAME
+
+    def draw_buttons(self, _context, layout):
+        _update_node_width_for_mode(self)
+        if node_params_in_npanel():
+            return
+        self._draw_params(_context, layout)
+
+    def _draw_params(self, context, layout):
+        domain_obj, _err = _resolve_dsph_solver_domain(self)
+        if domain_obj is not None:
+            layout.label(text=f"Domain: {domain_obj.name}", icon='CUBE')
+        else:
+            layout.label(text="No Domain - grid from Emitters", icon='INFO')
+
+        layout.prop(self, "smoke_seed_preview", text="Seed Preview",
+                    toggle=True,
+                    icon='HIDE_OFF' if self.smoke_seed_preview else 'HIDE_ON')
+
+        col = layout.column(align=True)
+        col.prop(self, "smoke_resolution")
+        col.prop(self, "smoke_substeps")
+
+        box = layout.box()
+        box.label(text="Fluid", icon='MATERIAL')
+        box.prop(self, "smoke_buoyancy")
+        box.prop(self, "smoke_vorticity")
+        box.prop(self, "smoke_density_decay")
+        box.prop(self, "smoke_temperature_decay")
+
+        box2 = layout.box()
+        box2.label(text="Solver", icon='SETTINGS')
+        box2.prop(self, "smoke_gravity")
+
+        layout.separator()
+        layout.label(text="Bake & preview smoke on the Cache node.",
+                     icon='INFO')
 class FLIPWATER_ND_mpm_solver(_FLIPWATER_NodeBase, bpy.types.Node):
     bl_idname = "FLIPWATER_ND_mpm_solver"
     bl_label = "MPM Solver"
@@ -2067,7 +2223,7 @@ class FLIPWATER_ND_mpm_solver(_FLIPWATER_NodeBase, bpy.types.Node):
         col3.prop(self, "mpm_flip_ratio")
         col3.prop(self, "mpm_friction")
         col3.separator()
-        col3.label(text="Colliders: not supported yet", icon='INFO')
+        col3.label(text="Collider input: static meshes", icon='MOD_PHYSICS')
 
         # Baking & preview live on the Cache node (connect MPM Solver -> Cache).
         mpm_props = getattr(_context.scene, "flip_water_mpm", None)

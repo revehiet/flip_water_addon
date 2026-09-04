@@ -36,6 +36,12 @@ def test_domain_optional():
     assert "_dsph_source_nodes" in ops
 
 
+def test_workspace_build_is_discovered_without_preferences():
+    ops = (_ROOT / "operators_dsph.py").read_text(encoding="utf-8")
+    assert 'os.path.join(os.path.dirname(__file__), "third_party",' in ops
+    assert '"DualSPHysics")' in ops
+
+
 def test_seed_and_cache_previews_wired():
     ops = (_ROOT / "operators_dsph.py").read_text(encoding="utf-8")
     panels = (_ROOT / "panels.py").read_text(encoding="utf-8")

@@ -211,6 +211,12 @@ PYBIND11_MODULE(flip_solver_core, m) {
             float o[3] = {ox, oy, oz};
             float t[3] = {tx, ty, tz};
             s.setBoundary(o, t);
+        })
+        .def("set_obstacle_sdf", [](MpmSolver& s, py::array_t<float, py::array::c_style | py::array::forcecast> sdf) {
+            auto buf = sdf.request();
+            if (buf.ndim != 1)
+                throw std::runtime_error("obstacle SDF must be a flat float32 array");
+            s.setObstacleSdf(static_cast<const float*>(buf.ptr), static_cast<size_t>(buf.shape[0]));
         });
 #else
     m.attr("mpm_enabled") = false;

@@ -37,6 +37,8 @@ def flip_water_frame_change(scene, depsgraph=None):
     operators.refresh_mpm_cache_previews(frame)
     from . import operators_dsph
     operators_dsph.refresh_dsph_cache_previews(frame)
+    from . import operators_smoke
+    operators_smoke.refresh_smoke_cache_previews(frame)
 
 
     from . import wake_deformer
@@ -80,15 +82,15 @@ def _seed_new_node_trees():
 
 @persistent
 def flip_water_depsgraph_update(scene, depsgraph=None):
-    from . import operators, panels
+    from . import operators, operators_dsph, operators_smoke, panels
 
     operators.cleanup_legacy_points_objects(scene)
     operators.refresh_all_domain_voxel_guides(bpy.context, scene)
     _check_obstacle_transforms(scene)
     operators.sync_seed_previews_from_node_graph(bpy.context)
     operators.sync_mpm_seed_previews_from_node_graph(bpy.context)
-    from . import operators_dsph
     operators_dsph.sync_dsph_seed_previews_from_node_graph(bpy.context)
+    operators_smoke.sync_smoke_seed_previews_from_node_graph(bpy.context)
     panels.apply_npanel_node_widths()
     # Fluid Mesher dataflow: (re)generate live surfaces the moment a Surface
     # node is added/connected — no scrub or manual Reconstruct needed.
@@ -102,11 +104,24 @@ def flip_water_depsgraph_update(scene, depsgraph=None):
     _seed_new_node_trees()
 
 
+@persistent
+def flip_water_load_post(_dummy):
+    """Drop draw batches and stale node references after loading a file."""
+    from . import operators, operators_dsph, operators_smoke
+
+    preview_overlay.clear_all()
+    operators.reset_preview_state()
+    operators_dsph.reset_preview_state()
+    operators_smoke.reset_preview_state()
+
+
 def register():
     if flip_water_frame_change not in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.append(flip_water_frame_change)
     if flip_water_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(flip_water_depsgraph_update)
+    if flip_water_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(flip_water_load_post)
 
 
 def unregister():
@@ -114,5 +129,8 @@ def unregister():
         bpy.app.handlers.frame_change_post.remove(flip_water_frame_change)
     if flip_water_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(flip_water_depsgraph_update)
+    if flip_water_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(flip_water_load_post)
     _obstacle_matrix_cache.clear()
+    preview_overlay.clear_all()
 

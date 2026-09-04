@@ -38,7 +38,14 @@ def _prefs(context):
 def _dsph_root(context):
     prefs = _prefs(context)
     root = getattr(prefs, "dsph_root", "") if prefs else ""
-    return root.strip() or None
+    if root.strip():
+        return root.strip()
+
+    # Development builds live beside this module. Installed extensions do not
+    # ship DualSPHysics, so their users continue to configure the preference.
+    local_build = os.path.join(os.path.dirname(__file__), "third_party",
+                               "DualSPHysics")
+    return local_build if os.path.isdir(local_build) else None
 
 
 def _dsph_cache_dir_for(node_name):
@@ -602,6 +609,13 @@ def _check_dsph_source_transforms(context):
                 dirty.add(key)
     for key in dirty:
         refresh_dsph_seed_preview(context, key)
+
+
+def reset_preview_state():
+    """Forget preview bookkeeping after a Blender file transition."""
+    _dsph_seed_previews.clear()
+    _dsph_seed_matrix_cache.clear()
+    _dsph_seed_points_cache.clear()
 
 
 

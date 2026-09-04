@@ -126,6 +126,19 @@ def _mpm_source_objects(node):
     return objs
 
 
+def _mpm_collider_objects(node):
+    """Meshes connected to an MPM Solver's Collider input, including Merge."""
+    from . import panels
+
+    sources = panels._expand_node_list(
+        panels._linked_nodes_from_input(node, "Collider"),
+        {"FLIPWATER_ND_obstacle"})
+    return [source.obstacle_object for source in sources
+            if getattr(source, "obstacle_object", None) is not None
+            and source.obstacle_object.type == 'MESH'
+            and source.obstacle_object.name in bpy.data.objects]
+
+
 def _mpm_grid_for_node(node):
     """Boundary box ((origin), (res)) for an MPM node — the single, shared
     domain fit used by both the bake and the seed preview."""
@@ -1312,6 +1325,16 @@ def _check_mpm_source_transforms(context):
         refresh_mpm_seed_preview(context, key)
 
 
+def reset_preview_state():
+    """Forget preview bookkeeping after a Blender file transition."""
+    _active_seed_previews.clear()
+    _seed_preview_matrix_cache.clear()
+    _seed_preview_points_cache.clear()
+    _mpm_seed_previews.clear()
+    _mpm_seed_matrix_cache.clear()
+    _mpm_seed_points_cache.clear()
+
+
 def _particles_consumed_by_surface(domain_obj):
     """Returns True if the particle stream for this domain is consumed by a
     Surface node without being merged back into the data stream.
@@ -1368,6 +1391,22 @@ _overlay_frame_state = {}   # domain name -> state of the last drawn particle ov
 _surface_preview_state = {}  # domain name -> (frame, id(pos)) of the last live surface preview
 
 
+def _domain_has_linked_flip_solver(domain_obj):
+    """Return whether a current FLIP Solver node still owns ``domain_obj``."""
+    from . import panels
+
+    for tree in bpy.data.node_groups:
+        if tree.bl_idname != panels.TREE_IDNAME:
+            continue
+        for node in tree.nodes:
+            if node.bl_idname != "FLIPWATER_ND_solver":
+                continue
+            domain_node, _emitters, _tanks, _obstacles, _sinks = panels._resolve_solver_links(node)
+            if domain_node is not None and domain_node.domain_object == domain_obj:
+                return True
+    return False
+
+
 def update_baked_domain_overlay(domain_obj, frame):
     """Draws cached frame particles as a viewport GPU overlay."""
     if domain_obj is None or not domain_obj.flip_water_is_domain:
@@ -1378,6 +1417,14 @@ def update_baked_domain_overlay(domain_obj, frame):
     props = domain_obj.flip_water_domain
     key = f"particles:{domain_obj.name}"
     if props.is_baking or not props.is_baked or not props.particle_overlay_enabled:
+        _overlay_frame_state.pop(domain_obj.name, None)
+        preview_overlay.clear_particle_preview(key)
+        preview_overlay.clear_colored_particle_preview(key)
+        return
+
+    # A baked domain can outlive its node graph. Do not keep drawing its cache
+    # after the FLIP Solver that owned the particle stream was deleted.
+    if not _domain_has_linked_flip_solver(domain_obj):
         _overlay_frame_state.pop(domain_obj.name, None)
         preview_overlay.clear_particle_preview(key)
         preview_overlay.clear_colored_particle_preview(key)
@@ -2630,8 +2677,8 @@ class FLIPWATER_OT_free_surface_cache(bpy.types.Operator):
 
 class FLIPWATER_OT_build_solver(bpy.types.Operator):
     bl_idname = "flip_water.build_solver"
-    bl_label = "Build FLIP Solver"
-    bl_description = ("Compiles the C++ FLIP solver core for this exact Blender/Python "
+    bl_label = "Build Native Solver Core"
+    bl_description = ("Compiles the shared C++ FLIP and CUDA MPM core for this exact Blender/Python "
                        "version using CMake. Requires a C++ compiler and CMake to be "
                        "installed on your system")
     bl_options = {'REGISTER'}
@@ -2781,7 +2828,11 @@ class FLIPWATER_OT_bake_mpm(bpy.types.Operator):
         settings.grid_origin_x, settings.grid_origin_y, settings.grid_origin_z = origin
         settings.grid_res_x, settings.grid_res_y, settings.grid_res_z = res
         settings.grid_stride = stride
-        settings.delta_time = 1.0 / (24.0 * float(node.mpm_substeps))
+        # The CUDA MPM stability probes use 0.2 ms per solver step.  The
+        # previous frame-rate-derived value was 8.3x larger at 25 substeps,
+        # which drives the stiff presets into collapse/NaNs.
+        settings.delta_time = min(
+            1.0 / (24.0 * float(node.mpm_substeps)), 0.0002)
         settings.substeps_per_frame = node.mpm_substeps
         settings.flip_ratio = node.mpm_flip_ratio
         settings.gravity_x = 0.0
@@ -2878,6 +2929,26 @@ class FLIPWATER_OT_bake_mpm(bpy.types.Operator):
         solver.init(positions, settings)
         self._solver = solver
 
+        # MPM owns a separate sparse grid, so FLIP's collider mask cannot be
+        # reused directly. Upload the same signed-distance representation to
+        # the native MPM core before stepping begins.
+        node = bpy.data.node_groups[self.node_tree_name].nodes[self.node_name]
+        collider_objs = _mpm_collider_objects(node)
+        if collider_objs:
+            expected = settings.grid_res_x * settings.grid_res_y * settings.grid_res_z
+            combined_sdf = np.full(expected, 1e6, dtype=np.float32)
+            origin = np.array((settings.grid_origin_x, settings.grid_origin_y,
+                               settings.grid_origin_z), dtype=np.float32)
+            depsgraph = context.evaluated_depsgraph_get()
+            for collider in collider_objs:
+                sdf = voxelize.compute_obstacle_sdf(
+                    depsgraph, collider, origin, settings.grid_stride,
+                    settings.grid_res_x, settings.grid_res_y, settings.grid_res_z)
+                combined_sdf = np.minimum(combined_sdf, sdf)
+            solver.set_obstacle_sdf(np.ascontiguousarray(combined_sdf))
+            print(f"[MPM] Uploaded SDF for {len(collider_objs)} static collider(s) "
+                  f"({int((combined_sdf <= 0.0).sum())} solid cells)")
+
         # Clear any pre-bake seed preview for this node — the live bake
         # preview takes over from here.
         try:
@@ -2894,8 +2965,9 @@ class FLIPWATER_OT_bake_mpm(bpy.types.Operator):
         if domain_obj is not None and hasattr(domain_obj, "flip_water_domain"):
             self._cache_fmt = getattr(domain_obj.flip_water_domain, "cache_format", "FWC2").lower()
 
-        print(f"[MPM] Starting bake: frames {self._frame_start}→{self._frame_end}, "
-              f"{self._substeps} substeps, {positions.shape[0]} particles")
+          print(f"[MPM] Starting bake: frames {self._frame_start}→{self._frame_end}, "
+              f"{self._substeps} substeps × {settings.delta_time:.6f}s, "
+              f"{positions.shape[0]} particles")
         print(f"[MPM] Cache: {self._cache_dir}")
 
         FLIPWATER_OT_bake_mpm._active_bakes[self.node_name] = self

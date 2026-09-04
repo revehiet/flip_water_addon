@@ -768,6 +768,12 @@ class FLIPWATER_WakeBakeState(PropertyGroup):
     bake_progress: FloatProperty(default=0.0, min=0.0, max=1.0)
 
 
+class FLIPWATER_SmokeBakeState(PropertyGroup):
+    is_baking: BoolProperty(default=False)
+    bake_current_frame: IntProperty(default=0)
+    bake_progress: FloatProperty(default=0.0, min=0.0, max=1.0)
+
+
 _CLASSES = (
     FLIPWATER_DomainSettings,
     FLIPWATER_EmitterSettings,
@@ -776,6 +782,7 @@ _CLASSES = (
     FLIPWATER_MpmBakeState,
     FLIPWATER_DsphBakeState,
     FLIPWATER_WakeBakeState,
+    FLIPWATER_SmokeBakeState,
 )
 
 
@@ -796,9 +803,11 @@ def register():
     bpy.types.Scene.flip_water_mpm = PointerProperty(type=FLIPWATER_MpmBakeState)
     bpy.types.Scene.flip_water_dsph = PointerProperty(type=FLIPWATER_DsphBakeState)
     bpy.types.Scene.flip_water_wake = PointerProperty(type=FLIPWATER_WakeBakeState)
+    bpy.types.Scene.flip_water_smoke = PointerProperty(type=FLIPWATER_SmokeBakeState)
 
 
 def unregister():
+    del bpy.types.Scene.flip_water_smoke
     del bpy.types.Scene.flip_water_wake
     del bpy.types.Scene.flip_water_dsph
     del bpy.types.Scene.flip_water_mpm

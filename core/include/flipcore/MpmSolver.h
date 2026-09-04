@@ -143,6 +143,10 @@ public:
     /// Change boundary box dynamically (e.g. moving domain).
     void setBoundary(const float origin[3], const float target[3]);
 
+    /// Upload one cell-centered signed-distance field for static colliders.
+    /// Values are ordered i + resX * (j + resY * k); negative is solid.
+    void setObstacleSdf(const float* sdf, size_t valueCount);
+
 private:
     // Device buffers
     float*        _d_particles  = nullptr;   // array of MpmParticleGPU
@@ -150,6 +154,8 @@ private:
     uint32_t*     _d_hashTable  = nullptr;   // cell -> (node index + 1), 0 = empty
     int32_t*      _d_cellCoords = nullptr;   // (i,j,k) cell of each active grid node
     uint32_t*     _d_gridCount  = nullptr;   // atomic counter of active grid nodes
+    float*        _d_obstacleSdf = nullptr;  // dense cell-centred collider SDF
+    size_t        _obstacleSdfCount = 0;
     MpmSettings   _settings;
     size_t        _numParticles = 0;
     size_t        _maxNodes     = 0;         // upper bound: 27 × particles

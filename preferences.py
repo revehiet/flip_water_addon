@@ -127,7 +127,7 @@ class FLIPWATER_AddonPreferences(AddonPreferences):
         col.label(text="Setup steps:")
         col.label(text=f"1. Install a standalone Python {needed}.x (python.org) matching this Blender.")
         col.label(text="2. Point 'Build Python Executable' above at it.")
-        col.label(text="3. Click 'Build FLIP Solver' (needs a C++ compiler + CMake on your system).")
+        col.label(text="3. Click 'Build Native Solver Core' (needs a C++ compiler + CMake on your system).")
         col.label(text="4. Add a FLIP Domain from the 3D Viewport's 'Add > Mesh' menu, or the sidebar panel.")
         col.label(text="5. During development, use 'Reload Addon Scripts' after Python edits (no reinstall needed).")
 

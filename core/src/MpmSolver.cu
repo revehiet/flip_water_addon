@@ -484,7 +484,31 @@ __global__ void updateGridKernel(
     }
 }
 
-// ── Grid collision (stick/slip at domain boundaries) ───────────────────────
+// ── Collider SDF sampling and grid collision ───────────────────────────────
+
+__device__ inline int sdfIndex(int i, int j, int k, int resX, int resY) {
+    return i + resX * (j + resY * k);
+}
+
+__device__ inline float sampleSdf(const float* sdf, int resX, int resY, int resZ,
+                                  float x, float y, float z) {
+    if (sdf == nullptr) return 1e6f;
+    x = fminf(fmaxf(x - 0.5f, 0.0f), (float)(resX - 1));
+    y = fminf(fmaxf(y - 0.5f, 0.0f), (float)(resY - 1));
+    z = fminf(fmaxf(z - 0.5f, 0.0f), (float)(resZ - 1));
+    int i0 = (int)floorf(x), i1 = min(i0 + 1, resX - 1);
+    int j0 = (int)floorf(y), j1 = min(j0 + 1, resY - 1);
+    int k0 = (int)floorf(z), k1 = min(k0 + 1, resZ - 1);
+    float fx = x - i0, fy = y - j0, fz = z - k0;
+    float c00 = sdf[sdfIndex(i0, j0, k0, resX, resY)] * (1.0f - fx) + sdf[sdfIndex(i1, j0, k0, resX, resY)] * fx;
+    float c10 = sdf[sdfIndex(i0, j1, k0, resX, resY)] * (1.0f - fx) + sdf[sdfIndex(i1, j1, k0, resX, resY)] * fx;
+    float c01 = sdf[sdfIndex(i0, j0, k1, resX, resY)] * (1.0f - fx) + sdf[sdfIndex(i1, j0, k1, resX, resY)] * fx;
+    float c11 = sdf[sdfIndex(i0, j1, k1, resX, resY)] * (1.0f - fx) + sdf[sdfIndex(i1, j1, k1, resX, resY)] * fx;
+    return (c00 * (1.0f - fy) + c10 * fy) * (1.0f - fz)
+         + (c01 * (1.0f - fy) + c11 * fy) * fz;
+}
+
+// ── Grid collision (stick/slip at domain and SDF boundaries) ───────────────
 //    Sparse version: nodes are identified by their cell; the domain walls sit
 //    at the first cell (cell index 0) and last cell (res-1) on each axis,
 //    matching the fixed-grid behaviour.
@@ -493,7 +517,7 @@ __global__ void gridCollisionKernel(
     float* grid, uint32_t* gridCount,
     const int32_t* cellCoords,
     int resX, int resY, int resZ,
-    float friction)
+    float friction, const float* obstacleSdf)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (int)(*gridCount)) return;
@@ -521,6 +545,12 @@ __global__ void gridCollisionKernel(
     if (cz <= 0 || cz >= resZ-1) {
         vz = 0.0f;
         if (friction > 0.0f) { vx *= (1.0f - friction); vy *= (1.0f - friction); }
+    }
+
+    if (sampleSdf(obstacleSdf, resX, resY, resZ, (float)cx, (float)cy, (float)cz) <= 0.0f) {
+        vx = 0.0f;
+        vy = 0.0f;
+        vz = 0.0f;
     }
 
     grid[G_VEL(idx)]   = vx;
@@ -690,7 +720,8 @@ __global__ void G2PKernel(
 __global__ void advectParticlesKernel(
     float* particles, int numParticles, float dt,
     float ox, float oy, float oz,
-    float tx, float ty, float tz)
+    float tx, float ty, float tz,
+    const float* obstacleSdf, int resX, int resY, int resZ, float h)
 {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= numParticles) return;
@@ -711,6 +742,32 @@ __global__ void advectParticlesKernel(
         if (particles[P_POS(p)+d] > hi[d]) {
             particles[P_POS(p)+d] = hi[d];
             particles[P_VEL(p)+d] = 0.0f;
+        }
+    }
+
+    float gx = (particles[P_POS(p)]   - ox) / h;
+    float gy = (particles[P_POS(p)+1] - oy) / h;
+    float gz = (particles[P_POS(p)+2] - oz) / h;
+    float distance = sampleSdf(obstacleSdf, resX, resY, resZ, gx, gy, gz);
+    if (distance < 0.0f) {
+        float dx = sampleSdf(obstacleSdf, resX, resY, resZ, gx + 1.0f, gy, gz)
+                 - sampleSdf(obstacleSdf, resX, resY, resZ, gx - 1.0f, gy, gz);
+        float dy = sampleSdf(obstacleSdf, resX, resY, resZ, gx, gy + 1.0f, gz)
+                 - sampleSdf(obstacleSdf, resX, resY, resZ, gx, gy - 1.0f, gz);
+        float dz = sampleSdf(obstacleSdf, resX, resY, resZ, gx, gy, gz + 1.0f)
+                 - sampleSdf(obstacleSdf, resX, resY, resZ, gx, gy, gz - 1.0f);
+        float length = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (length > 1e-6f) {
+            dx /= length; dy /= length; dz /= length;
+            particles[P_POS(p)]   -= distance * dx;
+            particles[P_POS(p)+1] -= distance * dy;
+            particles[P_POS(p)+2] -= distance * dz;
+            float normalVelocity = particles[P_VEL(p)] * dx + particles[P_VEL(p)+1] * dy + particles[P_VEL(p)+2] * dz;
+            if (normalVelocity < 0.0f) {
+                particles[P_VEL(p)]   -= normalVelocity * dx;
+                particles[P_VEL(p)+1] -= normalVelocity * dy;
+                particles[P_VEL(p)+2] -= normalVelocity * dz;
+            }
         }
     }
 }
@@ -736,6 +793,8 @@ void MpmSolver::_freeAll() {
     if (_d_hashTable)  { CUDA_CHECK(cudaFree(_d_hashTable));  _d_hashTable  = nullptr; }
     if (_d_cellCoords) { CUDA_CHECK(cudaFree(_d_cellCoords)); _d_cellCoords = nullptr; }
     if (_d_gridCount)  { CUDA_CHECK(cudaFree(_d_gridCount));  _d_gridCount  = nullptr; }
+    if (_d_obstacleSdf) { CUDA_CHECK(cudaFree(_d_obstacleSdf)); _d_obstacleSdf = nullptr; }
+    _obstacleSdfCount = 0;
     _numParticles = 0;
     _maxNodes = 0;
     _tableSize = 0;
@@ -861,7 +920,7 @@ void MpmSolver::step() {
     gridCollisionKernel<<<gGrid, gBlock>>>(
         _d_grid, _d_gridCount,
         _d_cellCoords, resX, resY, resZ,
-        _settings.boundaryFriction);
+        _settings.boundaryFriction, _d_obstacleSdf);
 
     // 5. G2P — APIC gather + FLIP blend + plasticity
     G2PKernel<<<pGrid, pBlock>>>(
@@ -876,7 +935,8 @@ void MpmSolver::step() {
     float tz = oz + resZ * h;
     advectParticlesKernel<<<pGrid, pBlock>>>(
         _d_particles, (int)_numParticles, dt,
-        ox, oy, oz, tx, ty, tz);
+        ox, oy, oz, tx, ty, tz,
+        _d_obstacleSdf, resX, resY, resZ, h);
 
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -906,6 +966,22 @@ void MpmSolver::setBoundary(const float origin[3], const float target[3]) {
     _settings.gridResX = (int)((target[0] - origin[0]) / h + 0.5f);
     _settings.gridResY = (int)((target[1] - origin[1]) / h + 0.5f);
     _settings.gridResZ = (int)((target[2] - origin[2]) / h + 0.5f);
+}
+
+void MpmSolver::setObstacleSdf(const float* sdf, size_t valueCount) {
+    size_t expected = static_cast<size_t>(_settings.gridResX)
+                    * static_cast<size_t>(_settings.gridResY)
+                    * static_cast<size_t>(_settings.gridResZ);
+    if (sdf == nullptr || valueCount != expected) {
+        fprintf(stderr, "MPM obstacle SDF ignored: expected %zu values, got %zu\n", expected, valueCount);
+        return;
+    }
+    if (_d_obstacleSdf == nullptr || _obstacleSdfCount != expected) {
+        if (_d_obstacleSdf) CUDA_CHECK(cudaFree(_d_obstacleSdf));
+        CUDA_CHECK(cudaMalloc(&_d_obstacleSdf, expected * sizeof(float)));
+        _obstacleSdfCount = expected;
+    }
+    CUDA_CHECK(cudaMemcpy(_d_obstacleSdf, sdf, expected * sizeof(float), cudaMemcpyHostToDevice));
 }
 
 } // namespace flipcore

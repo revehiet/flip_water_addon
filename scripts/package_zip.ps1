@@ -9,16 +9,18 @@ $distDir = Join-Path $root 'dist'
 $pkgName = 'flip_water_addon'
 $stageRoot = Join-Path $distDir $pkgName
 $zipPath = Join-Path $distDir "$pkgName.zip"
+$cudaDlls = @('cudart64_12.dll', 'cublas64_12.dll', 'cublasLt64_12.dll')
 
 if (Test-Path $stageRoot) { Remove-Item -Recurse -Force $stageRoot }
 if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
 New-Item -ItemType Directory -Path $stageRoot | Out-Null
 
-$excludeDirs = @('__pycache__', '.git', '.vscode', '.venv', 'dist', 'core/build', '_wheel_probe')
+$excludeDirs = @('__pycache__', '.git', '.vscode', '.venv', 'dist', 'core/build', '_wheel_probe', 'third_party')
 $excludeFiles = @('*.pyc', '*.pyo', '*.zip', '*.whl')
 
 Get-ChildItem -Path $root -Force | ForEach-Object {
     $name = $_.Name
+    $destTop = Join-Path $stageRoot $name
     if ($excludeDirs -contains $name) { return }
     if ($name -eq 'core') {
         New-Item -ItemType Directory -Path (Join-Path $stageRoot 'core') | Out-Null
@@ -43,7 +45,33 @@ Get-ChildItem -Path $root -Force | ForEach-Object {
         return
     }
 
-    $destTop = Join-Path $stageRoot $name
+    # CUDA runtime DLLs can be hundreds of MB and are intentionally not
+    # distributed; avoid staging them only to delete them before zipping.
+    if ($name -eq 'bin') {
+        $binRoot = $_.FullName
+        New-Item -ItemType Directory -Path $destTop | Out-Null
+        Get-ChildItem -Path $binRoot -Recurse -Force |
+            Where-Object {
+                $_.FullName -notlike '*\__pycache__\*' -and
+                ($_.PSIsContainer -or (
+                    $_.Extension -notin @('.pyc', '.pyo', '.whl') -and
+                    $cudaDlls -notcontains $_.Name
+                ))
+            } |
+            ForEach-Object {
+            $rel = $_.FullName.Substring($binRoot.Length).TrimStart('\')
+            $dest = Join-Path $destTop $rel
+            if ($_.PSIsContainer) {
+                if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest | Out-Null }
+            } else {
+                $parent = Split-Path $dest -Parent
+                if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent | Out-Null }
+                Copy-Item $_.FullName $dest -Force
+            }
+        }
+        return
+    }
+
     if ($_.PSIsContainer) {
         Copy-Item $_.FullName $destTop -Recurse -Force
         Get-ChildItem -Path $destTop -Recurse -Force -Directory |
@@ -71,7 +99,6 @@ if ($wheelSrc) {
 # CUDA runtime DLLs (cudart/cublas, ~800 MB) are resolved from the locally
 # installed CUDA toolkit at load time (solver_bridge registers every toolkit
 # version's bin dir), so they must NOT be shipped inside the extension zip.
-$cudaDlls = @('cudart64_12.dll', 'cublas64_12.dll', 'cublasLt64_12.dll')
 Get-ChildItem -Path (Join-Path $stageRoot 'bin') -Recurse -Force -File |
     Where-Object { $cudaDlls -contains $_.Name } |
     Remove-Item -Force

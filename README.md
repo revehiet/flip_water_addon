@@ -87,7 +87,7 @@ whole folder zipped up (or, on the filesystem, just place this whole folder
 inside Blender's `scripts/addons/` or `scripts/addons_ext/` directory).
 Enable "FLIP Water Simulation (C++ Core)" in the list.
 
-If you build the core *after* installing, click "Build FLIP Solver" in the
+If you build the core *after* installing, click "Build Native Solver Core" in the
 addon's preferences panel, or restart Blender, to pick it up.
 
 ## Usage
